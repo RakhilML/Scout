@@ -72,13 +72,53 @@ scout history ./reports       # list saved reports in a folder
 
 ---
 
-## What a run actually does
+## How it works
 
-1. **Search** — hits DuckDuckGo with your goal, pulls N results (default 6)
-2. **Fetch** — grabs the actual pages in parallel, not just the snippets. Skips paywalls and Cloudflare-blocked sites automatically
-3. **Extract** — trafilatura pulls clean article text, falls back to BeautifulSoup, falls back to the DDG snippet if needed
-4. **Analyze** — sends everything to your local LLM. Tries DSPy + Instructor first for structured output, falls back to a raw prompt if that doesn't work. You always get something
-5. **Save** — writes a `.md` report and a `.json` file to your output folder
+```
+                        YOU
+                         |
+             "latest RTX 5090 benchmarks"
+                         |
+                    +----v----+
+                    |  Scout  |
+                    +----+----+
+                         |
+              +----------+----------+
+              |                     |
+       +------v------+     +--------v-------+
+       | DuckDuckGo  |     |  LM Studio     |
+       |   Search    |     |  (local LLM)   |
+       +------+------+     +--------+-------+
+              |                     ^
+         [N result URLs]            |
+              |                     |
+       +------v-----------+         |
+       |  Parallel Fetch  |         |
+       |  (4 workers)     |         |
+       +------+-----------+         |
+              |                     |
+       +------v-----------+         |
+       |  Text Extraction |         |
+       |  trafilatura     |         |
+       |  -> BS4          |         |
+       |  -> DDG snippet  |         |
+       +------+-----------+         |
+              |                     |
+       [clean page text] ---------->+
+                                    |
+                          +---------v--------+
+                          | DSPy + Instructor|
+                          | (structured out) |
+                          |  -> raw fallback |
+                          +---------+--------+
+                                    |
+                           +--------v--------+
+                           |  Save Report    |
+                           |  .md  +  .json  |
+                           +-----------------+
+```
+
+**One-shot run** executes this pipeline once and exits. **Scheduled run** repeats it on your chosen interval, saving a new report each time.
 
 ---
 
