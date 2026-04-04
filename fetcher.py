@@ -68,6 +68,12 @@ BLOCKED_DOMAINS = {
     "linkedin.com",
     # Deal sites (Cloudflare-protected)
     "slickdeals.net",
+    # Other paywalls / login-gated
+    "substack.com",
+    "theatlantic.com",
+    "newyorker.com",
+    "thetimes.co.uk",
+    "wired.com",
 }
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
