@@ -47,7 +47,8 @@ logs/
 *.sqlite
 *.sqlite3
 
-# Pytest / coverage
+# Tool caches
+.ruff_cache/
 .pytest_cache/
 .coverage
 htmlcov/

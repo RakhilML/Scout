@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scout"
+dynamic = ["version"]
+description = "Private, verifiable web monitoring with a local LLM: reports only what changed, with a quote behind every claim."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+    "requests>=2.32",
+    # No hard-coded Accept-Encoding: urllib3 advertises br/zstd only when these decoders are installed.
+    "urllib3[brotli,zstd]>=2.5",
+    "trafilatura>=2.0",
+    "lxml>=5.0",
+    "pypdf>=5.0",
+    "price-parser>=0.5",
+    "rapidfuzz>=3.9",
+    "ddgs>=9.10",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "APScheduler>=3.11,<4",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+notify = ["apprise>=1.9,<2"]
+mcp = ["mcp>=2.0"]
+render = ["playwright>=1.49"]
+dev = ["pytest>=8.0", "responses>=0.25", "ruff>=0.6"]
+
+[project.scripts]
+scout = "scout.cli:main"
+
+[tool.hatch.version]
+path = "src/scout/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scout"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "RUF", "PT"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs the real network (run with: pytest -m live)"]
+addopts = "-m 'not live'"
+faulthandler_timeout = 120
+filterwarnings = ["ignore:codecs.open\\(\\) is deprecated:DeprecationWarning:tld"]
