@@ -1,0 +1,12 @@
+description: Follow a product's price and hear when it drops or goes under your limit.
+params:
+  product: the product, e.g. "RTX 5090"
+  below: optional; alert under this price, e.g. "1800 USD"
+watches:
+  - name: "{slug}-price"
+    goal: "cheapest {product} price right now"
+    every: 6h
+    kind: price
+    alerts:
+      - drop 5%
+      - price below {below}

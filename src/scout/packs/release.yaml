@@ -1,0 +1,11 @@
+description: Hear when a project ships a new version.
+params:
+  project: the software, e.g. "Python" or "llama.cpp"
+watches:
+  - name: "{slug}-release"
+    goal: "latest {project} release: version number and release date"
+    every: 1d
+    kind: release
+    alerts:
+      - new
+      - changed

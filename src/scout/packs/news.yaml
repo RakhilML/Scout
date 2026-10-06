@@ -1,0 +1,13 @@
+description: A daily look at what is new on a topic.
+params:
+  topic: what to follow, e.g. "open-source LLMs"
+  keyword: optional; alert only on news that mentions this
+watches:
+  - name: "{slug}-news"
+    goal: "latest news about {topic}"
+    every: 1d
+    kind: news
+    recency: week
+    alerts:
+      - new
+      - mentions "{keyword}"

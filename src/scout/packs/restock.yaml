@@ -1,0 +1,11 @@
+description: Hear when a sold-out product can be bought again.
+params:
+  product: the product, e.g. "Steam Deck OLED"
+watches:
+  - name: "{slug}-stock"
+    goal: "where to buy {product}: in stock or sold out"
+    every: 3h
+    kind: price
+    alerts:
+      - in stock
+    stop_when_alerted: true
