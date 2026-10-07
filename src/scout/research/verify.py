@@ -5,6 +5,9 @@ appears in that quote, the source's title or the source's dates. A quote may dif
 the page (extraction and tokenization differ between the page and what the model saw), but never
 in a number. A quote found in a different source than the one cited is re-attributed rather than
 rejected. The price lines Scout adds from a page's schema.org data count as part of that source.
+
+A fact-check is stricter: the claim is under test, so the quote alone must state its numbers,
+single digits included.
 """
 
 from __future__ import annotations
@@ -24,17 +27,25 @@ from scout.web.domains import hostname
 
 QUOTE_MATCH_THRESHOLD = 90  # rapidfuzz partial_ratio on folded text, 0-100
 _MAX_QUOTE_CHARS = 400  # long quotes are checked by their opening, which is plenty to anchor them
-_MIN_QUOTE_CHARS = 12
+MIN_QUOTE_CHARS = 12
 # The word boundary guards only the magnitude: extracted tables glue cells together
 # ("Amazon$3299current", "$2073mid-range"), and those numbers must still be read.
 _NUMBER = re.compile(rf"(\d[\d,]*(?:\.\d+)?)(?:\s*({MAGNITUDE_PATTERN})\b)?", re.IGNORECASE)
+_CURRENCY = re.compile("[$\N{EURO SIGN}\N{POUND SIGN}\N{YEN SIGN}\N{INDIAN RUPEE SIGN}]\\s?$")
 _STALE_NEWS_DAYS = 30
+# A fact-check compares single digits, and pages write small numbers as words ("two moons").
+_NUMBER_WORDS = ("two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
+_NUMBER_WORD = re.compile(rf"\b({'|'.join(_NUMBER_WORDS)}|eleven|twelve)\b", re.IGNORECASE)
 
 
-def verify(findings: Sequence[ModelFinding], sources: Sequence[Source]) -> list[Finding]:
+def verify(
+    findings: Sequence[ModelFinding], sources: Sequence[Source], *, strict: bool = False
+) -> list[Finding]:
+    """*strict* is for a claim under test (a fact-check): the page's title and dates cannot vouch
+    for it, and every digit counts."""
     by_index = {source.index: source for source in sources}
     folded = {source.index: fold(evidence(source)) for source in sources}
-    return [_verify_one(finding, by_index, folded) for finding in findings]
+    return [_verify_one(finding, by_index, folded, strict) for finding in findings]
 
 
 def evidence(source: Source) -> str:
@@ -44,7 +55,9 @@ def evidence(source: Source) -> str:
     return source.text + "\n" + "\n".join(offer_line(offer) for offer in source.offers)
 
 
-def _verify_one(found: ModelFinding, sources: dict[int, Source], folded: dict[int, str]) -> Finding:
+def _verify_one(
+    found: ModelFinding, sources: dict[int, Source], folded: dict[int, str], strict: bool
+) -> Finding:
     # The model may withhold trust from a fact (the page makes it doubtful), never grant it.
     doubt = f"doubtful: {clean(found.doubt)}" if found.doubt and found.doubt.strip() else None
 
@@ -62,17 +75,19 @@ def _verify_one(found: ModelFinding, sources: dict[int, Source], folded: dict[in
         )
 
     quote = fold(found.quote)[:_MAX_QUOTE_CHARS]
-    if len(quote) < _MIN_QUOTE_CHARS:
+    if len(quote) < MIN_QUOTE_CHARS:
         return result(found.source, Verdict.UNVERIFIED, "quote too short to check")
 
+    digits = 1 if strict else 2
     cited_first = sorted(sources, key=lambda index: index != found.source)
     for index in cited_first:
-        if not quoted_in(folded[index], quote):
+        if locate(folded[index], quote, min_digits=digits) is None:
             continue
         source = sources[index]
         dates = " ".join(d.isoformat() for d in (source.published, source.updated) if d)
-        missing = numbers(fold(f"{found.claim} {found.value or ''}")) - numbers(
-            f"{quote} {fold(source.title)} {dates}"
+        stated = quote if strict else f"{quote} {fold(source.title)} {dates}"
+        missing = numbers(fold(f"{found.claim} {found.value or ''}"), min_digits=digits) - numbers(
+            stated, min_digits=digits
         )
         if missing:
             listed = ", ".join(sorted(missing))
@@ -90,28 +105,55 @@ def quoted_in(text: str, quote: str) -> bool:
     A near match absorbs extraction noise (spacing, punctuation, a dropped word), never a changed
     number: "sells for $1,849" is not a near match for "sells for $1,999".
     """
-    if quote in text:
-        return True
+    return locate(text, quote) is not None
+
+
+def locate(text: str, quote: str, *, min_digits: int = 2) -> tuple[int, int] | None:
+    """Where *quote* occurs in *text* (both folded), as quoted_in() finds it: (start, end)."""
+    start = text.find(quote)
+    if start >= 0:
+        return start, start + len(quote)
     match = fuzz.partial_ratio_alignment(quote, text, score_cutoff=QUOTE_MATCH_THRESHOLD)
     if match is None:
-        return False
-    return numbers(quote) <= numbers(_whole_words(text, match.dest_start, match.dest_end))
+        return None
+    start, end = _whole_words(text, match.dest_start, match.dest_end)
+    if numbers(quote, min_digits=min_digits) <= numbers(text[start:end], min_digits=min_digits):
+        return start, end
+    return None
 
 
-def _whole_words(text: str, start: int, end: int) -> str:
-    """text[start:end] widened to whitespace, so a number cut by the match is read whole."""
+def _whole_words(text: str, start: int, end: int) -> tuple[int, int]:
+    """The span start:end widened to whitespace, so a number cut by the match is read whole."""
     while start > 0 and not text[start - 1].isspace():
         start -= 1
     while end < len(text) and not text[end].isspace():
         end += 1
-    return text[start:end]
+    return start, end
 
 
-def numbers(text: str) -> set[str]:
-    """Numbers of two or more digits, normalized so that different spellings of one value agree:
-    '1,999.00' -> '1999', '1,66,269' -> '166269', '78k' and '78,000' -> '78000'."""
-    found = set()
-    for digits, magnitude in _NUMBER.findall(text):
+def numbers(text: str, *, min_digits: int = 2) -> set[str]:
+    """Numbers of *min_digits* or more digits, normalized so that different spellings of one
+    value agree: '1,999.00' -> '1999', '1,66,269' -> '166269', '78k' and '78,000' -> '78000'.
+
+    Research skips lone digits, which in its findings are mostly list numbering; a fact-check
+    compares every digit, since "7 rings" and "5 rings" are different claims.
+    """
+    return set(numbers_as_written(text, min_digits=min_digits))
+
+
+def numbers_as_written(text: str, *, min_digits: int = 2) -> dict[str, str]:
+    """numbers(), each with how *text* first writes it. "m" and "b" are million and billion
+    only after a currency sign: "330 m" is a height, "$330m" an amount."""
+    found: dict[str, str] = {}
+    for match in _NUMBER.finditer(text):
+        digits, magnitude = match.groups()
+        before = max(0, match.start() - 2)
+        if (
+            magnitude
+            and magnitude.lower() in ("m", "b")
+            and not _CURRENCY.search(text, before, match.start())
+        ):
+            magnitude = None
         try:
             value = Decimal(digits.replace(",", "").rstrip("."))
         except InvalidOperation:
@@ -119,8 +161,14 @@ def numbers(text: str) -> set[str]:
         if magnitude:
             value *= MAGNITUDES[magnitude.lower()]
         normalized = format(value.normalize(), "f")
-        if sum(ch.isdigit() for ch in normalized) >= 2:
-            found.add(normalized)
+        if sum(ch.isdigit() for ch in normalized) >= min_digits:
+            written = match.group(0) if magnitude else digits
+            found.setdefault(normalized, written.strip().rstrip(",."))
+    if min_digits == 1:
+        for match in _NUMBER_WORD.finditer(text):
+            word = match.group(1).lower()
+            value = {"eleven": 11, "twelve": 12}.get(word) or _NUMBER_WORDS.index(word) + 2
+            found.setdefault(str(value), match.group(1))
     return found
 
 

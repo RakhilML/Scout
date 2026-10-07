@@ -26,11 +26,18 @@ _DOUBLE_QUOTES = (
     "\N{DOUBLE LOW-9 QUOTATION MARK}\N{DOUBLE HIGH-REVERSED-9 QUOTATION MARK}\N{DOUBLE PRIME}"
 )
 
+# Control characters, which a terminal would run (an escape sequence can clear the screen);
+# tab and line breaks stay.
+_CONTROL = "".join(
+    map(chr, (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), *range(0x7F, 0xA0)))
+)
+
 _CLEAN_TABLE = str.maketrans(
     {
         **dict.fromkeys(_SPACE_LIKE, " "),
         **dict.fromkeys(_HYPHEN_LIKE, "-"),
         **dict.fromkeys(_INVISIBLE),
+        **dict.fromkeys(_CONTROL),
     }
 )
 _FOLD_TABLE = str.maketrans(

@@ -4,7 +4,7 @@ from decimal import Decimal
 
 from scout.research.results import Finding, Flag, Source, Verdict
 from scout.research.schema import ModelFinding
-from scout.research.verify import assess, quoted_in, verify
+from scout.research.verify import assess, locate, numbers, quoted_in, verify
 from scout.web.extract import Offer
 
 TODAY = date(2026, 9, 25)
@@ -128,6 +128,55 @@ def test_number_formats_are_normalized_and_title_numbers_count():
         [DOCS, SHOP],
     )
     assert [r.verdict for r in ok] == [Verdict.VERIFIED, Verdict.VERIFIED]
+
+
+def test_numbers_keep_lone_digits_only_when_asked():
+    assert numbers("GPT-4 has 7 rings and 1,999 stars") == {"1999"}
+    assert numbers("GPT-4 has 7 rings and 1,999 stars", min_digits=1) == {"4", "7", "1999"}
+
+
+def test_locate_finds_where_a_quote_is():
+    text = "deal: it was sold for 1,999.00 dollars today"
+    assert locate(text, "sold for 1,999.00 dollars") == (13, 38)
+    assert locate(text, "sold for 1,999.00 dolars today") == (13, 44)  # near, widened to words
+    assert locate(text, "sold for 1,899.00 dolars today") is None
+
+
+PEP = Source(
+    index=1,
+    url="https://peps.example/pep-0719/",
+    title="PEP 719 - Python 3.13 Release Schedule",
+    site="peps.example",
+    status="ok",
+    query="q",
+    published=date(2023, 5, 26),
+    text="Expected: 3.13.0 final: Monday, October 7. Saturn has 7 rings.",
+)
+
+
+def test_in_a_fact_check_the_quote_alone_states_the_claims_numbers():
+    # The schedule was published in 2023, but its quote never says 3.13 shipped in 2023.
+    dated = finding(
+        "Python 3.13 was released on October 7, 2023.", "3.13.0 final: Monday, October 7."
+    )
+    rings = finding("Saturn has 5 rings.", "Saturn has 7 rings.")
+    strict = verify([dated, rings], [PEP], strict=True)
+    assert [(f.verdict, f.note) for f in strict] == [
+        (Verdict.UNVERIFIED, "the quote does not contain 2023"),
+        (Verdict.UNVERIFIED, "the quote does not contain 5"),
+    ]
+    # Research is unchanged: a page's title and dates count, and lone digits are list numbering.
+    assert [f.verdict for f in verify([dated, rings], [PEP])] == [Verdict.VERIFIED] * 2
+
+
+def test_in_a_fact_check_a_near_quote_may_not_change_a_lone_digit():
+    page = replace(PEP, text="Python 3.13.0 final shipped on October 7 after a long beta.")
+    near = finding(
+        "3.13.0 shipped in October", "Python 3.13.0 final shipped on October 1 after a long beta."
+    )
+    (strict,) = verify([near], [page], strict=True)
+    assert (strict.verdict, strict.note) == (Verdict.UNVERIFIED, "quote not found in the source")
+    assert verify([near], [page])[0].verdict is Verdict.VERIFIED
 
 
 def test_too_short_quote_is_not_checkable():
@@ -293,3 +342,9 @@ def test_a_quote_from_a_search_snippet_says_so():
     (finding,) = verify([claim], [snippet])
     assert finding.verdict is Verdict.VERIFIED
     assert finding.note == "quoted from the search result: the page itself could not be read"
+
+
+def test_m_and_b_are_millions_only_after_a_currency_sign_and_small_numbers_may_be_words():
+    assert numbers("The tower is 330 m tall; the deal was $330m.") == {"330", "330000000"}
+    assert numbers("Mars has two moons.", min_digits=1) == {"2"}
+    assert numbers("Mars has two moons.") == set()  # research compares numbers of 2+ digits

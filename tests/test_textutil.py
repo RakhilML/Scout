@@ -42,3 +42,7 @@ def test_shorten_prefers_word_boundaries():
     assert shorten("short", 10) == "short"
     assert shorten("the quick brown fox jumps", 16) == "the quick brown\N{HORIZONTAL ELLIPSIS}"
     assert len(shorten("x" * 50, 10)) == 10
+
+
+def test_clean_drops_control_characters_a_terminal_would_run():
+    assert clean("before\x1b[2Jafter\x07 and\ttab\nline") == "before[2Jafter and tab\nline"
