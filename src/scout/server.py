@@ -1,4 +1,4 @@
-"""Scout as an MCP server: research, recall and watches as tools for AI assistants.
+"""Scout as an MCP server: research, fact-checks, recall and watches as tools for AI assistants.
 
 Everything a tool returns is evidence-first: each finding comes with the quote that backs it and
 the page it is on, and findings Scout could not verify are listed apart with the reason.
@@ -17,6 +17,7 @@ from scout.monitor.runner import DEFAULT_RULES, notifier_for, run_watch
 from scout.monitor.trends import series
 from scout.monitor.watches import Watch, WatchBook
 from scout.report import render_markdown
+from scout.research.factcheck import CLAIM_LIMIT, MAX_CLAIMS
 from scout.research.results import RunResult
 
 try:
@@ -29,8 +30,9 @@ except ImportError as exc:  # an optional extra
 INSTRUCTIONS = """\
 Scout researches the web with the user's own local model and reports only facts it can back \
 with a verbatim quote from a page. Try `recall` first: it answers instantly from what Scout has \
-already verified. `research` reads the web now and can take a few minutes. Watches re-run a goal \
-on a schedule and report what changed."""
+already verified. `research` reads the web now and can take a few minutes. `fact_check` checks a \
+text (a draft answer, an article, a web address) claim by claim against independent pages. \
+Watches re-run a goal on a schedule and report what changed."""
 
 Recency = Literal["day", "week", "month", "year", "any"]
 
@@ -52,11 +54,25 @@ def build(app: App) -> MCPServer:
         if recency is not None:
             options["recency"] = recency
         with _as_tool_errors():
-            researcher = app.researcher(**options)
+            researcher = app.researcher(public_only=True, **options)
             result = researcher.run_deep(goal) if deep else researcher.run(goal)
             app.learn_from(researcher)
             run_id = app.store.add_run(result)
         return _brief(result, run_id)
+
+    @server.tool(annotations=browses)
+    def fact_check(text: str, max_claims: int = MAX_CLAIMS) -> dict[str, Any]:
+        """Check a text (a draft answer, an article, or a web address) claim by claim against
+        independent pages. Each ruling rests on quotes Scout found word for word on a page;
+        quotes the model offered that are not there are listed under set_aside, and numbers
+        the text states that no claim covered under unchecked. Addresses on private networks
+        are refused."""
+        with _as_tool_errors():
+            researcher = app.researcher(public_only=True, max_results=3)
+            result = researcher.check(text, max_claims=max(1, min(max_claims, CLAIM_LIMIT)))
+            app.learn_from(researcher)
+            run_id = app.store.add_run(result)
+        return _checked(result, run_id)
 
     @server.tool(annotations=reads)
     def recall(question: str, limit: int = 8) -> dict[str, Any]:
@@ -94,7 +110,9 @@ def build(app: App) -> MCPServer:
         """Run a watch now: what changed since its last run, and which alerts that raised."""
         with _as_tool_errors():
             watch = book.get(name)
-            outcome = run_watch(app, watch, notifier=notifier_for(watch), book=book)
+            outcome = run_watch(
+                app, watch, notifier=notifier_for(watch), book=book, public_only=True
+            )
         return {
             "run_id": outcome.run_id,
             "first_run": outcome.baseline,
@@ -159,27 +177,62 @@ def _as_tool_errors() -> Iterator[None]:
         raise ToolError(str(exc)) from exc
 
 
-def _brief(result: RunResult, run_id: int) -> dict[str, Any]:
-    def page(index: int) -> dict[str, Any]:
-        source = result.source(index)
-        if source is None:
-            return {}
-        date = source.freshest_date
-        return {"url": source.url, "site": source.site, "date": date.isoformat() if date else None}
+def _page(result: RunResult, index: int) -> dict[str, Any]:
+    source = result.source(index)
+    if source is None:
+        return {}
+    date = source.freshest_date
+    return {"url": source.url, "site": source.site, "date": date.isoformat() if date else None}
 
+
+def _brief(result: RunResult, run_id: int) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "answer": result.answer,
         "confidence": result.confidence.level,
         "confidence_reason": result.confidence.reason,
         "findings": [
-            {"claim": finding.claim, "quote": finding.quote, **page(finding.source)}
+            {"claim": finding.claim, "quote": finding.quote, **_page(result, finding.source)}
             for finding in result.trusted
         ],
         "set_aside": [
             {"claim": finding.claim, "why": finding.note or finding.verdict.value}
             for finding in result.findings
             if not finding.trusted
+        ],
+        "warnings": list(result.warnings),
+    }
+
+
+def _checked(result: RunResult, run_id: int) -> dict[str, Any]:
+    evidence = result.numbered
+
+    def quotes(numbers: tuple[int, ...]) -> list[dict[str, Any]]:
+        return [
+            {"quote": evidence[n - 1].quote, **_page(result, evidence[n - 1].source)}
+            for n in numbers
+        ]
+
+    return {
+        "run_id": run_id,
+        "summary": result.answer,
+        "confidence": result.confidence.level,
+        "confidence_reason": result.confidence.reason,
+        "claims": [
+            {
+                "claim": claim.claim,
+                "in_text": claim.excerpt,
+                "ruling": claim.ruling.value,
+                "note": claim.note,
+                "supports": quotes(claim.supports),
+                "refutes": quotes(claim.refutes),
+                "set_aside": [
+                    {"quote": finding.quote, "why": finding.note or finding.verdict.value}
+                    for finding in (evidence[n - 1] for n in claim.set_aside)
+                ],
+                "unchecked": list(claim.unchecked),
+            }
+            for claim in result.claims
         ],
         "warnings": list(result.warnings),
     }

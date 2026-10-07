@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import click
 from rich.markdown import Markdown
@@ -24,9 +25,11 @@ from scout.report import (
     render_note,
     save,
 )
-from scout.research.pipeline import MAX_ROUNDS
+from scout.research.factcheck import CLAIM_LIMIT, MAX_CLAIMS
+from scout.research.pipeline import MAX_ROUNDS, Researcher
+from scout.research.results import CHECK_KIND, RunResult
 from scout.settings import Settings
-from scout.textutil import shorten
+from scout.textutil import clean, looks_like_junk, shorten
 from scout.web.domains import hostname
 
 
@@ -72,16 +75,94 @@ def run(
         researcher = app.researcher(**overrides)
         with err.status("Researching\N{HORIZONTAL ELLIPSIS}", spinner="dots"):
             result = researcher.run_deep(goal, rounds=rounds) if deep else researcher.run(goal)
-        app.learn_from(researcher)
-        run_id = None if no_save else app.store.add_run(result)
-        paths = None if no_save else save(result, app.settings.reports_dir, run_id=run_id)
+        _finish(app, researcher, result, as_json=as_json, no_save=no_save)
 
+
+@click.command()
+@click.argument("subject", required=False)
+@click.option(
+    "-f",
+    "--file",
+    "text_file",
+    type=click.File("rb"),
+    help="Check the text in this file ('-' reads standard input).",
+)
+@click.option(
+    "--claims",
+    type=click.IntRange(1, CLAIM_LIMIT),
+    default=MAX_CLAIMS,
+    show_default=True,
+    help="Claims to check at most.",
+)
+@click.option(
+    "-n",
+    "--pages",
+    type=click.IntRange(1, 10),
+    default=3,
+    show_default=True,
+    help="Pages to read per claim.",
+)
+@click.option("--llm", "llm_spec", help="Override SCOUT_LLM, e.g. exchange:./answers")
+@click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
+@click.option("--no-save", is_flag=True, help="Do not keep the check or write report files.")
+def factcheck(
+    subject: str | None,
+    text_file: BinaryIO | None,
+    claims: int,
+    pages: int,
+    llm_spec: str | None,
+    as_json: bool,
+    no_save: bool,
+) -> None:
+    """Check the claims in SUBJECT, a text or a web address, against independent pages.
+
+    Each claim is ruled supported, refuted, disputed or unclear from quotes Scout found word for
+    word on the pages it read. The saved report includes an annotated page (.html) of the text.
+    """
+    if (subject is None) == (text_file is None):
+        raise click.UsageError("give the text to check, or -f FILE, but not both")
+    name = getattr(text_file, "name", "<stdin>")
+    text = subject if text_file is None else _decoded(text_file.read(), name)
+    if text_file is not None and looks_like_junk(text):
+        raise click.UsageError(f"could not read {name} as text: save it as UTF-8")
+    if not clean(text):
+        raise click.UsageError("nothing to check")
+    with App(settings(), llm=llm_spec) as app:
+        researcher = app.researcher(max_results=pages)
+        with err.status("Fact-checking\N{HORIZONTAL ELLIPSIS}", spinner="dots"):
+            result = researcher.check(text, max_claims=claims)
+        _finish(app, researcher, result, as_json=as_json, no_save=no_save)
+
+
+def _decoded(data: bytes, name: str) -> str:
+    """A file's text: UTF-8 with or without a BOM, or UTF-16 with one (what PowerShell's `>`
+    and Notepad's "Unicode" write on Windows). Anything else is refused, not guessed at: a
+    misread letter could change what is checked."""
+    utf16 = data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    try:
+        return data.decode("utf-16" if utf16 else "utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise click.UsageError(f"could not read {name} as text: save it as UTF-8") from exc
+
+
+def _finish(
+    app: App, researcher: Researcher, result: RunResult, *, as_json: bool, no_save: bool
+) -> None:
+    """Keep a finished run (unless *no_save*), then print it."""
+    app.learn_from(researcher)
+    run_id = None if no_save else app.store.add_run(result)
+    paths = None if no_save else save(result, app.settings.reports_dir, run_id=run_id)
     if as_json:
-        out.print_json(render_json(result, run_id=run_id))
+        data = json.loads(render_json(result, run_id=run_id))
+        if paths:
+            data["saved"] = [str(path) for path in paths]
+        out.print_json(data=data)
         return
     out.print(Markdown(render_markdown(result, run_id=run_id)))
     if paths:
         err.print(f"[dim]Saved {escape(str(paths[0]))}[/]")
+        for page in (path for path in paths if path.suffix == ".html"):
+            err.print(f"[dim]Annotated page: {escape(str(page))}[/]")
 
 
 @click.command()
@@ -117,12 +198,12 @@ def rate(run_id: int, number: int, verdict: str, note: str | None) -> None:
     """Say whether finding NUMBER of a run (as its report numbers them) is right."""
     with App(settings()) as app:
         rating = app.rate(run_id, number, verdict, note=note)
+        rated = app.store.get_run(run_id)
     out.print(f"Rated {verdict}: {escape(rating.claim)}")
     if verdict == "bad" and rating.trusted:
-        out.print(
-            "  [dim]Scout had trusted it: it is forgotten, and eval cases made from this run "
-            "will expect it untrusted.[/]"
-        )
+        cases = rated is not None and rated.plan.kind != CHECK_KIND  # a check makes no cases
+        later = ", and eval cases made from this run will expect it untrusted" if cases else ""
+        out.print(f"  [dim]Scout had trusted it: it is forgotten{later}.[/]")
 
 
 @click.command()

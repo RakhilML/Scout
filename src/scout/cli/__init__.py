@@ -25,6 +25,7 @@ def main(verbose: int) -> None:
 
 for _command in (
     research.run,
+    research.factcheck,
     research.ask,
     research.rate,
     research.ratings,

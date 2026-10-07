@@ -68,27 +68,37 @@ def notifier_for(watch: Watch) -> Notifier | None:
 
 
 def run_watch(
-    app: App, watch: Watch, *, notifier: Notifier | None = None, book: WatchBook | None = None
+    app: App,
+    watch: Watch,
+    *,
+    notifier: Notifier | None = None,
+    book: WatchBook | None = None,
+    public_only: bool = False,
 ) -> WatchRun:
     """Run *watch* once; one run of a watch at a time. Given its *book*, a watch that stops when
-    alerted is paused."""
+    alerted is paused; *public_only* reads only the public internet (a run an assistant asked
+    for)."""
     lock = FileLock(
         app.settings.data_dir / "locks" / f"{watch.name}.lock",
         wait=False,
         busy=f"watch {watch.name!r} is already running",
     )
     with lock:
-        return _run(app, watch, notifier, book)
+        return _run(app, watch, notifier, book, public_only)
 
 
-def _run(app: App, watch: Watch, notifier: Notifier | None, book: WatchBook | None) -> WatchRun:
+def _run(
+    app: App, watch: Watch, notifier: Notifier | None, book: WatchBook | None, public_only: bool
+) -> WatchRun:
     history = [result for _, result in app.store.last_runs(watch.name, limit=EARLIER_RUNS)]
     earlier = earlier_pages(app, history)
     previous = history[0] if history else None
     if previous is not None and previous.goal != clean(watch.goal):
         previous = None  # the question was edited: plan again, and start a new baseline
 
-    researcher = app.researcher(fresh=True, scope=f"watch:{watch.name}", **_options(watch))
+    researcher = app.researcher(
+        fresh=True, public_only=public_only, scope=f"watch:{watch.name}", **_options(watch)
+    )
     # The first run plans the searches; later runs repeat them, so results stay comparable.
     result = researcher.run(watch.goal, plan=previous.plan if previous else None, reuse=previous)
     app.learn_from(researcher)

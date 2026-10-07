@@ -12,7 +12,7 @@ from scout.llm import make_backend, model_server
 from scout.llm.base import Backend
 from scout.llm.probe import AGENT_CONTEXT_TOKENS, Capabilities, probe
 from scout.research.pipeline import Researcher, ResearchOptions
-from scout.research.results import RunResult, Source
+from scout.research.results import CHECK_KIND, RunResult, Source
 from scout.settings import Settings
 from scout.store import Rating, Store
 from scout.web.fetch import FetchConfig, Fetcher
@@ -56,6 +56,12 @@ class App:
             cache=self.store,
             renderer=self._renderer,
         )
+        # For callers a web page may have steered (assistants over MCP): no private hosts, and
+        # no browser running a page's scripts.
+        self.public_fetcher = Fetcher(
+            replace(fetch_config, public_only=True, fresh_for=WATCH_PAGE_FRESHNESS),
+            cache=self.store,
+        )
         self.watch_search = CachedSearch(
             self._search_backend, self.store, max_age=WATCH_SEARCH_CACHE_SECONDS
         )
@@ -71,6 +77,7 @@ class App:
     def close(self) -> None:
         self.fetcher.close()
         self.watch_fetcher.close()
+        self.public_fetcher.close()
         self._search_backend.close()
         if self._renderer is not None:
             self._renderer.close()
@@ -111,10 +118,16 @@ class App:
             )
 
     def researcher(
-        self, *, fresh: bool = False, scope: str = "", **overrides: object
+        self,
+        *,
+        fresh: bool = False,
+        public_only: bool = False,
+        scope: str = "",
+        **overrides: object,
     ) -> Researcher:
-        """A researcher for the configured model; *fresh* uses the watches' fresher caches, and
-        *scope* names who runs it (a watch), so that runs of one goal resume apart."""
+        """A researcher for the configured model; *fresh* uses the watches' fresher caches,
+        *public_only* reads only pages on the public internet, and *scope* names who runs it
+        (a watch), so that runs of one goal resume apart."""
         found = self.capabilities()
         options = ResearchOptions(
             max_results=self.settings.max_results,
@@ -126,9 +139,9 @@ class App:
         )
         return Researcher(
             search=self.watch_search if fresh else self.search,
-            fetcher=self.watch_fetcher if fresh else self.fetcher,
+            fetcher=self._fetcher_for(fresh=fresh, public_only=public_only),
             backend=self.backend,
-            options=replace(options, **overrides),
+            options=replace(options, public_only=public_only, **overrides),
             sites=self.store,
             pins=self.store,
             pin_scope=scope,
@@ -159,9 +172,7 @@ class App:
 
     def replay(self, run_id: int) -> tuple[RunResult, RunResult]:
         """Analyze a stored run's pages again with the configured model: (before, after)."""
-        before = self.store.get_run(run_id)
-        if before is None:
-            raise ScoutError(f"no run with id {run_id}")
+        before = self._research_run(run_id)
         sources, missing = self.restore_sources(before)
         note = f"replay of run {run_id}"
         if missing:
@@ -200,9 +211,7 @@ class App:
 
     def case_from_run(self, run_id: int, name: str) -> EvalCase:
         """A stored run as an eval case; its ratings become what the case expects."""
-        result = self.store.get_run(run_id)
-        if result is None:
-            raise ScoutError(f"no run with id {run_id}")
+        result = self._research_run(run_id)
         sources, missing = self.restore_sources(result)
         if missing:
             raise ScoutError(f"run {run_id} cannot become a case: {missing} page(s) are gone")
@@ -229,6 +238,23 @@ class App:
             researcher = self.researcher()
         result = researcher.reanalyze(case.goal, case.plan, case.sources, note=f"eval {case.name}")
         return result, score(case, result)
+
+    def _research_run(self, run_id: int) -> RunResult:
+        """A stored run whose pages can be analyzed again. A fact-check's cannot: analysis
+        would extract findings for a goal, not weigh evidence on its claims."""
+        result = self.store.get_run(run_id)
+        if result is None:
+            raise ScoutError(f"no run with id {run_id}")
+        if result.plan.kind == CHECK_KIND:
+            raise ScoutError(
+                f"run {run_id} is a fact-check: check the text again with scout factcheck"
+            )
+        return result
+
+    def _fetcher_for(self, *, fresh: bool, public_only: bool) -> Fetcher:
+        if public_only:
+            return self.public_fetcher
+        return self.watch_fetcher if fresh else self.fetcher
 
     def _capabilities_key(self) -> str:
         server = model_server(self.backend)
