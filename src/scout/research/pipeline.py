@@ -1,4 +1,5 @@
-"""A research run: plan, search, read, pack, extract, verify, assess."""
+"""A research run: plan, search, read, pack, extract, verify, assess. And a fact-check: the same
+for each claim a text makes."""
 
 from __future__ import annotations
 
@@ -18,22 +19,36 @@ from scout.errors import (
     AnswerPending,
     ContextOverflow,
     LLMError,
+    ScoutError,
     SearchError,
     StructuredOutputError,
     UnsupportedResponseFormat,
 )
 from scout.llm.base import Backend, Message
 from scout.llm.structured import StructuredMode, generate
-from scout.research import prompts
+from scout.research import factcheck, prompts
 from scout.research.plan import heuristic_plan, model_plan
 from scout.research.rank import coverage, pack
 from scout.research.reputation import SiteBook, SiteRecord
-from scout.research.results import Finding, Flag, Plan, RunResult, Source
-from scout.research.schema import Extraction, FollowUp, Synthesis
+from scout.research.results import CHECK_KIND, Finding, Flag, Plan, RunResult, Source
+from scout.research.schema import (
+    ClaimList,
+    ClaimToCheck,
+    Extraction,
+    FollowUp,
+    Judgment,
+    Synthesis,
+)
 from scout.research.values import attach_amounts, flag_values, offer_findings
 from scout.research.verify import assess, verify
-from scout.textutil import clean
-from scout.web.domains import canonical_url, hostname
+from scout.textutil import clean, fold, shorten
+from scout.web.domains import (
+    canonical_url,
+    hostname,
+    matches_any,
+    private_address,
+    registrable_domain,
+)
 from scout.web.fetch import Document, Fetcher
 from scout.web.search import SearchBackend, SearchHit, merge_hits
 
@@ -66,6 +81,7 @@ class ResearchOptions:
     fetch_deadline: float = 45.0
     structured_mode: StructuredMode = StructuredMode.PROMPT
     reasoning_options: tuple[str, ...] = ()
+    public_only: bool = False  # a caller a web page may have steered: no private addresses
 
 
 class Pins(Protocol):
@@ -140,7 +156,8 @@ class Researcher:
         """Do *work*, keeping what it read while it waits for a model answer: started again, the
         run reads the same pages on the same day, so its prompts (and their answers) match."""
         self._reads = {}
-        self._run_key = json.dumps([goal, mode, self._pin_scope], ensure_ascii=False)
+        scope = [goal, mode, self._pin_scope, self._options.public_only]
+        self._run_key = json.dumps(scope, ensure_ascii=False)
         if self._pins is None:
             return work()
         self._pins.drop_pins(self._run_key, before=self._clock() - PIN_TTL)
@@ -173,17 +190,20 @@ class Researcher:
         warnings: list[str],
         *,
         exclude: Collection[str] = (),
+        avoid: Collection[str] = (),
         start: int = 1,
     ) -> list[Source]:
         """Search, then read the pages worth reading: as they were read before, if pinned."""
-        key = _read_key(plan, exclude, self._options)
+        key = _read_key(plan, exclude, avoid, self._options)
         read = self._pin(key)
         if read is None:
             found: list[str] = []
-            hits = self._find(goal, plan, found, exclude=exclude)
+            hits = self._find(goal, plan, found, exclude=exclude, avoid=avoid)
             documents = self._fetcher.fetch_many(
                 [hit.url for hit in hits], deadline=self._options.fetch_deadline
             )
+            if avoid:
+                hits, documents = _independent(hits, documents, avoid, found)
             read = {
                 "hits": [hit.to_dict() for hit in hits],
                 "documents": [document.to_dict() for document in documents],
@@ -313,6 +333,166 @@ class Researcher:
             return _warn(result, f"kept the first round's answer: the final one failed ({exc})")
         return replace(result, answer=clean(synthesis.answer), finished_at=self._clock())
 
+    def check(self, subject: str, *, max_claims: int = factcheck.MAX_CLAIMS) -> RunResult:
+        """Fact-check a text, or the page at a web address, claim by claim.
+
+        The model lists the claims and quotes pages on each. Scout keeps only the claims the
+        text makes, and rules on each from the quotes it verified, so no ruling rests on the
+        model's word. Pages from the checked page's own site are never evidence.
+
+        With the public_only option (callers a web page may have steered, such as an assistant
+        over MCP) an address on a private network is refused rather than read.
+        """
+        subject = clean(subject)
+        if not subject:
+            raise ScoutError("nothing to check")
+        return self._pinned(
+            hashlib.sha256(subject.encode()).hexdigest(),
+            f"check:{max_claims}",
+            lambda: self._check(subject, max_claims),
+        )
+
+    def _check(self, subject: str, max_claims: int) -> RunResult:
+        started = self._started()
+        today = started.date()
+        warnings: list[str] = []
+        text, page = self._subject(subject)
+        claims, planner, text, set_aside = self._claims(text, today, max_claims, warnings)
+        plan = Plan(
+            queries=tuple(claim.query for claim in claims),
+            kind=CHECK_KIND,
+            recency=None,
+            planner=planner,
+        )
+        origin = (subject, page.final_url or "") if page is not None else ()
+        avoid = frozenset(registrable_domain(host) for host in map(hostname, origin) if host)
+        sources: list[Source] = []
+        weighed = []
+        for number, claim in enumerate(claims, start=1):
+            log.info("checking claim %d of %d", number, len(claims))
+            noted: list[str] = []
+            searched = replace(plan, queries=(claim.query,))
+            item = self._check_claim(claim, searched, avoid, sources, today, noted)
+            weighed.append(item._replace(caveat=factcheck.caveat(claim, text)))
+            warnings.extend(f"claim {number}: {warning}" for warning in noted)
+        findings, checks = factcheck.assemble(weighed)
+        answer, confidence = factcheck.summarize(checks, findings, sources, set_aside=set_aside)
+        named = subject if page is not None else shorten(" ".join(text.split()), 80)
+        return RunResult(
+            goal=f"fact-check: {named}",
+            started_at=started,
+            finished_at=self._clock(),
+            model=self._backend.model,
+            plan=plan,
+            sources=tuple(sources),
+            answer=answer,
+            findings=tuple(findings),
+            confidence=confidence,
+            warnings=tuple(warnings),
+            claims=tuple(checks),
+            checked_text=text,
+        )
+
+    def _subject(self, subject: str) -> tuple[str, Document | None]:
+        """The text to check, and the page it comes from when *subject* is a web address: that
+        page is read once and pinned, like the pages a run reads."""
+        if not subject.startswith(("http://", "https://")) or len(subject.split()) > 1:
+            return subject, None
+        public_only = self._options.public_only
+        if public_only:
+            _refuse_private(subject)
+        pinned = self._pin("subject")
+        page = (
+            Document.from_dict(pinned)
+            if pinned
+            else self._fetcher.fetch_many([subject], deadline=self._options.fetch_deadline)[0]
+        )
+        if public_only and page.final_url:
+            _refuse_private(page.final_url)
+        self._reads["subject"] = page.to_dict()
+        if not page.ok or not page.text:
+            reason = page.error or page.status.value.replace("_", " ")
+            raise ScoutError(f"could not read {subject}: {reason}")
+        text = page.text
+        if page.title and not fold(text).startswith(fold(page.title)):
+            text = f"{page.title}\n\n{text}"
+        return clean(text), page
+
+    def _claims(
+        self, text: str, today: date, max_claims: int, warnings: list[str]
+    ) -> tuple[list[ClaimToCheck], str, str, int]:
+        """The claims to check, who chose them (the model, or the heuristic of checking every
+        sentence when the model's list is unusable), the text as checked (cut to what fits the
+        model's context window), and how many listed claims the text does not make."""
+        budget = source_budget(self._options.context_tokens)
+        whole = len(text)
+        try:
+            try:
+                text, listed = self._listed(text, today, max_claims, budget)
+            except ContextOverflow:
+                # Token estimates are approximate; the server's verdict wins. One smaller retry.
+                text, listed = self._listed(text, today, max_claims, int(budget * 0.6))
+        except StructuredOutputError as exc:
+            warnings.append(
+                "checked the text sentence by sentence: "
+                f"the model's list of claims was unusable ({exc})"
+            )
+            text = _cut(text[:budget], whole, warnings)
+            return factcheck.sentences(text, max_claims), "heuristic", text, 0
+        claims, set_aside = factcheck.anchored(listed.claims, text, max_claims)
+        warnings.extend(set_aside)
+        return claims, "model", _cut(text, whole, warnings), len(set_aside)
+
+    def _listed(
+        self, text: str, today: date, max_claims: int, budget: int
+    ) -> tuple[str, ClaimList]:
+        text = text[:budget]
+        messages = prompts.claims_messages(text, today, max_claims=max_claims)
+        return text, self._generate(messages, ClaimList, purpose="claims")
+
+    def _check_claim(
+        self,
+        claim: ClaimToCheck,
+        plan: Plan,
+        avoid: Collection[str],
+        sources: list[Source],
+        today: date,
+        warnings: list[str],
+    ) -> factcheck.Weighed:
+        """Search and read for one claim, leaving out the sites *avoid*, then weigh the quotes
+        the model finds on its pages. The pages join *sources*, the run's, keeping their number
+        if an earlier claim read them. A reply that is unusable leaves this claim unclear; a
+        model that is down or still to answer stops the check."""
+        try:
+            found = self._read(claim.claim, plan, warnings, avoid=avoid)
+        except SearchError as exc:
+            warnings.append(str(exc))
+            return factcheck.Weighed(claim, [], [], None, (str(exc),))
+        found = factcheck.renumber(found, sources)
+        try:
+            judgment = self._judge(claim.claim, found, today, warnings)
+        except StructuredOutputError as exc:
+            warnings.append(f"not judged ({exc})")
+            return factcheck.Weighed(claim, [], [], None, (f"not judged ({exc})",))
+        supports, refutes = factcheck.weigh(claim.claim, judgment, found)
+        problems = (factcheck.NOTHING_READ,) if factcheck.NOTHING_READ in warnings else ()
+        return factcheck.Weighed(claim, supports, refutes, clean(judgment.note) or None, problems)
+
+    def _judge(
+        self, claim: str, sources: Sequence[Source], today: date, warnings: list[str]
+    ) -> Judgment:
+        def ask(budget: int) -> tuple[Judgment, int]:
+            blocks, left_out = self._blocks(claim, sources, budget)
+            if not blocks:
+                warnings.append(factcheck.NOTHING_READ)
+                return Judgment(note=""), left_out
+            messages = prompts.judge_messages(
+                claim, today, blocks, max_evidence=factcheck.MAX_EVIDENCE
+            )
+            return self._generate(messages, Judgment, purpose="judge"), left_out
+
+        return self._fitted(ask, warnings)
+
     def _analyze(
         self,
         goal: str,
@@ -377,17 +557,26 @@ class Researcher:
             return self._generate_plan(goal, today)
 
     def _find(
-        self, goal: str, plan: Plan, warnings: list[str], *, exclude: Collection[str] = ()
+        self,
+        goal: str,
+        plan: Plan,
+        warnings: list[str],
+        *,
+        exclude: Collection[str] = (),
+        avoid: Collection[str] = (),
     ) -> list[SearchHit]:
-        """The hits to read; *exclude* holds (canonical) URLs already read."""
+        """The hits to read; *exclude* holds (canonical) URLs already read, *avoid* the sites
+        (with their subdomains) that may not be read: the checked text's own."""
         wanted = self._options.max_results
+        # Results from the avoided sites are dropped below: ask for more, so others fill in.
+        count = wanted * 3 if avoid else wanted
         news = plan.kind == "news"
-        results = [self._search(query, plan.recency, news) for query in plan.queries]
+        results = [self._search(query, plan.recency, news, count) for query in plan.queries]
         if news and not any(results):
-            results = [self._search(query, plan.recency, False) for query in plan.queries]
+            results = [self._search(query, plan.recency, False, count) for query in plan.queries]
         if plan.recency and not any(results):
             warnings.append(f"nothing from the last {plan.recency}; searched without a date limit")
-            results = [self._search(query, None, False) for query in plan.queries]
+            results = [self._search(query, None, False, count) for query in plan.queries]
         hits = [
             hit
             for hit in merge_hits(results, limit=wanted * 3 + len(exclude))
@@ -395,15 +584,22 @@ class Researcher:
         ]
         if not hits:
             raise SearchError("no search results for: " + "; ".join(plan.queries))
+        others = [hit for hit in hits if not matches_any(hit.url, avoid)]
+        if len(others) < len(hits):
+            where = f"{', '.join(sorted(avoid))}, where the text comes from"
+            if not others:
+                raise SearchError(f"every search result is from {where}")
+            warnings.append(f"left out {len(hits) - len(others)} search result(s) from {where}")
+            hits = others
         known = self._sites.site_records({hostname(hit.url) for hit in hits}) if self._sites else {}
         return _select(
             hits, goal, plan, limit=wanted, warnings=warnings, sites=known, now=self._clock()
         )
 
-    def _search(self, query: str, recency: str | None, news: bool) -> list[SearchHit]:
+    def _search(self, query: str, recency: str | None, news: bool, count: int) -> list[SearchHit]:
         return self._search_backend.search(
             query,
-            max_results=self._options.max_results,
+            max_results=count,
             region=self._options.region,
             recency=recency,
             news=news,
@@ -412,24 +608,38 @@ class Researcher:
     def _extract(
         self, goal: str, plan: Plan, sources: Sequence[Source], today: date, warnings: list[str]
     ) -> Extraction:
-        budget = source_budget(self._options.context_tokens)
         query = " ".join((goal, *plan.queries))
+        return self._fitted(
+            lambda budget: self._extract_within(goal, query, sources, today, budget), warnings
+        )
+
+    def _fitted(self, ask: Callable[[int], tuple[T, int]], warnings: list[str]) -> T:
+        """*ask*'s reply with as much source text as the context window holds: *ask* takes a
+        budget in characters and returns its reply and how many readable pages did not fit."""
+        budget = source_budget(self._options.context_tokens)
         try:
-            extraction, left_out = self._extract_within(goal, query, sources, today, budget)
+            reply, left_out = ask(budget)
         except ContextOverflow:
             # Token estimates are approximate; the server's verdict wins. One smaller retry.
             warnings.append("the sources did not fit the model's context window; sent less text")
-            extraction, left_out = self._extract_within(
-                goal, query, sources, today, int(budget * 0.6)
-            )
+            reply, left_out = ask(int(budget * 0.6))
         if left_out:
             warnings.append(f"{left_out} readable page(s) did not fit the context window")
-        return extraction
+        return reply
 
     def _extract_within(
         self, goal: str, query: str, sources: Sequence[Source], today: date, budget: int
     ) -> tuple[Extraction, int]:
         """The model's extraction, and how many readable pages the budget had to leave out."""
+        blocks, left_out = self._blocks(query, sources, budget)
+        if not blocks:
+            return Extraction(answer="None of the sources could be read.", findings=[]), left_out
+        messages = prompts.extract_messages(goal, today, blocks, max_findings=MAX_FINDINGS)
+        return self._generate(messages, Extraction, purpose="extract"), left_out
+
+    def _blocks(self, query: str, sources: Sequence[Source], budget: int) -> tuple[list[str], int]:
+        """The passages most relevant to *query* that fit *budget*, fenced for the prompt
+        source by source, and how many readable pages did not fit."""
         packed = pack(
             [(source.index, source.text) for source in sources if source.text],
             query,
@@ -438,10 +648,7 @@ class Researcher:
         )
         left_out = sum(1 for s in sources if not s.snippet_only and s.index not in packed)
         blocks = [prompts.source_block(s, packed[s.index]) for s in sources if s.index in packed]
-        if not blocks:
-            return Extraction(answer="None of the sources could be read.", findings=[]), left_out
-        messages = prompts.extract_messages(goal, today, blocks, max_findings=MAX_FINDINGS)
-        return self._generate(messages, Extraction, purpose="extract"), left_out
+        return blocks, left_out
 
     def _generate(self, messages: list[Message], output: type[T], *, purpose: str) -> T:
         try:
@@ -487,10 +694,13 @@ def _select(
     sites: Mapping[str, SiteRecord],
     now: datetime,
 ) -> list[SearchHit]:
-    """Keep the hits most about the goal (IDF-weighted term coverage), a few per site at most.
+    """Keep the hits most about the goal (IDF-weighted term coverage), a few per site at most,
+    in search order.
 
     What earlier runs learned about the sites comes second: it reorders relevant hits a little
-    and skips sites that keep failing, but never makes an off-topic hit relevant.
+    and skips sites that keep failing, but never makes an off-topic hit relevant. Relevance and
+    reputation decide which pages are read, never their numbers, so the same pages make the
+    same prompts however the sites' records changed.
     """
     texts = [f"{hit.title} {hit.snippet}" for hit in hits]
     relevance = [
@@ -522,19 +732,19 @@ def _select(
             "skipped sites that keep failing: " + "; ".join(sorted(set(avoided.values())))
         )
 
-    chosen: list[SearchHit] = []
+    chosen: list[int] = []
     per_site: Counter[str] = Counter()
     for i in candidates:
         site = hostname(hits[i].url)
         if per_site[site] < _MAX_PER_SITE:
-            chosen.append(hits[i])
+            chosen.append(i)
             per_site[site] += 1
         if len(chosen) == limit:
             break
     off_topic = len(hits) - len(on_topic)
     if filtered and off_topic:
         warnings.append(f"ignored {off_topic} off-topic search result(s)")
-    return chosen
+    return [hits[i] for i in sorted(chosen)]
 
 
 def _sources(
@@ -578,16 +788,12 @@ def _warn(result: RunResult, warning: str) -> RunResult:
 def _carried_sources(before: Sequence[Source], after: Sequence[Source]) -> list[Source] | None:
     """*after* numbered as *before* was, when both are the same pages with the same content
     (snippets compared by text) in any order; None when anything differs."""
-
-    def signature(source: Source) -> tuple[str, str | None, str | None]:
-        return (source.url, source.content_hash, source.text if source.snippet_only else None)
-
-    now = {signature(source): source for source in after}
+    now = {source.reading: source for source in after}
     if not before or len(now) != len(after) or len(before) != len(after):
         return None
-    if set(now) != {signature(source) for source in before}:
+    if set(now) != {source.reading for source in before}:
         return None
-    return [replace(now[signature(source)], index=source.index) for source in before]
+    return [replace(now[source.reading], index=source.index) for source in before]
 
 
 def _report_order(findings: Sequence[Finding]) -> list[Finding]:
@@ -614,10 +820,42 @@ def _flag_stale(
     return marked
 
 
-def _read_key(plan: Plan, exclude: Collection[str], options: ResearchOptions) -> str:
-    what = [plan.queries, plan.kind, plan.recency, sorted(exclude), options.max_results]
-    encoded = json.dumps([*what, options.region], ensure_ascii=False).encode("utf-8")
-    return "read:" + hashlib.sha256(encoded).hexdigest()[:16]
+def _cut(text: str, whole: int, warnings: list[str]) -> str:
+    if len(text) < whole:
+        warnings.append(f"only the first {len(text):,} characters were checked")
+    return text
+
+
+def _independent(
+    hits: Sequence[SearchHit],
+    documents: Sequence[Document],
+    avoid: Collection[str],
+    warnings: list[str],
+) -> tuple[list[SearchHit], list[Document]]:
+    """The pages read that did not land on an avoided site (a short link, an aggregator)."""
+    kept = [
+        (hit, doc)
+        for hit, doc in zip(hits, documents, strict=True)
+        if not (doc.final_url and matches_any(doc.final_url, avoid))
+    ]
+    if len(kept) < len(hits):
+        where = ", ".join(sorted(avoid))
+        warnings.append(f"left out {len(hits) - len(kept)} page(s) that redirect to {where}")
+    return [hit for hit, _ in kept], [doc for _, doc in kept]
+
+
+def _refuse_private(url: str) -> None:
+    address = private_address(url)
+    if address is not None:
+        raise ScoutError(f"will not read {url}: it is on a private network ({address})")
+
+
+def _read_key(
+    plan: Plan, exclude: Collection[str], avoid: Collection[str], options: ResearchOptions
+) -> str:
+    what = [plan.queries, plan.kind, plan.recency, sorted(exclude), sorted(avoid)]
+    encoded = json.dumps([*what, options.max_results, options.region], ensure_ascii=False)
+    return "read:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
 def _unreadable_warning(sources: Sequence[Source]) -> list[str]:

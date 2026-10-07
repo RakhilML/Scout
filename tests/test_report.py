@@ -14,9 +14,10 @@ from scout.report import (
     save,
     slug,
 )
-from scout.research.results import RunResult
+from scout.research.results import ClaimCheck, RunResult
 from scout.settings import load_settings
 from scout.store import Store
+from tests.helpers import CHECK_RESULT
 from tests.helpers import SAMPLE_RESULT as RESULT
 
 
@@ -143,3 +144,133 @@ def test_a_url_cannot_split_the_sources_table_or_plant_a_link():
     text = render_markdown(replace(RESULT, sources=(replace(RESULT.sources[0], url=url),)))
     assert "](https://phish.example/login)" not in text
     assert "https://evil.example/a%7C%5BOfficial%20site%5D(https://phish.example/login)%7C" in text
+
+
+def test_a_fact_check_shows_each_claims_ruling_with_its_numbered_evidence():
+    text = render_markdown(CHECK_RESULT, run_id=14)
+    verdict = (
+        "**Verdict** \N{EM DASH} medium confidence (2 of 2 claims settled, 1 by two or more sites)"
+    )
+    assert f"{verdict}\n\nOf 2 claims: 1 supported, 1 refuted." in text
+    assert "## Findings" not in text
+    assert "## Not used" not in text
+    claims = text.split("## Claims")[1].split("## Sources")[0]
+    assert "1. **Refuted** (1 site): Python 3.13 was released on October 7, 2023." in claims
+    assert '   In the text: "Python 3.13 was released on October 7, 2023."' in claims
+    release = "https://www.python.org/downloads/release/python-3130/"
+    assert (
+        '   - refutes [1]: "Python 3.13.0 was released on October 7, 2024." '
+        f"([source 1]({release}), python.org, 2024-10-07)"
+    ) in claims
+    assert (
+        '   - set aside [4]: "Python 3.13 was released on October 7, 2024." '
+        "([source 2](https://docs.python.org/3/whatsnew/3.13.html)) "
+        "\N{EM DASH} the quote does not contain 2023"
+    ) in claims
+    assert "   _The sources give October 7, 2024._" in claims
+    assert "2. **Supported** (2 sites): Python 3.13 added an experimental JIT compiler." in claims
+    assert (
+        '   - confirms [3]: "Python 3.13 ships an experimental JIT compiler." '
+        "([source 3](https://realpython.com/python313-new-features/), realpython.com)"
+    ) in claims
+
+    refuted, supported = CHECK_RESULT.claims
+    # Sites are counted by the domain they belong to: python.org and docs.python.org are one.
+    one_site = replace(CHECK_RESULT, claims=(replace(supported, supports=(1, 2)),))
+    assert "1. **Supported** (1 site): " in render_markdown(one_site)
+
+    unchecked = replace(CHECK_RESULT, claims=(replace(refuted, unchecked=("2024",)),))
+    assert (
+        '   In the text: "Python 3.13 was released on October 7, 2023."\n\n'
+        "   Not checked: 2024, which the passage also states\n"
+    ) in render_markdown(unchecked)
+
+    unsettled = replace(CHECK_RESULT, claims=(replace(supported, supports=(), note=None),))
+    text = render_markdown(unsettled)
+    assert "1. **Unclear**: Python 3.13 added an experimental JIT compiler." in text
+    assert "   - no quote on the pages settles it" in text
+
+    nothing = replace(CHECK_RESULT, sources=(), findings=(), claims=(), checked_text="")
+    assert "## Sources" not in render_markdown(nothing)
+    assert "<h2>Sources</h2>" not in render_html(nothing)
+
+
+def test_a_fact_checks_page_marks_each_claim_in_the_text_it_checked():
+    page = render_html(CHECK_RESULT, run_id=14)
+    assert "<h2>The text</h2>" in page
+    assert (
+        '<div class="checked"><a class="mark" href="#claim-1"><mark class="refuted" '
+        'title="Claim 1 (refuted): Python 3.13 was released on October 7, 2023. \N{EM DASH} '
+        '&quot;Python 3.13.0 was released on October 7, 2024.&quot; (python.org)">'
+        "Python 3.13 was released on October 7, 2023.</mark></a>"
+        '<a class="badge refuted" href="#claim-1">1</a> <a class="mark" href="#claim-2">'
+        '<mark class="supported" '
+    ) in page
+    assert (
+        '<li id="claim-2"><p><span class="ruling supported">Supported</span> (2 sites): '
+        "Python 3.13 added an experimental JIT compiler.</p>"
+    ) in page
+    assert (
+        '<p>confirms [3] (<a href="https://realpython.com/python313-new-features/">source 3</a>, '
+        "realpython.com)</p><blockquote>Python 3.13 ships an experimental JIT compiler."
+        "</blockquote>"
+    ) in page
+    assert (
+        'set aside [4]: "Python 3.13 was released on October 7, 2024." '
+        '<a href="https://docs.python.org/3/whatsnew/3.13.html">(source 2)</a> '
+        "&mdash; the quote does not contain 2023"
+    ) in page
+    assert "<script" not in page
+
+    # One sentence, two rulings: the most serious colours it, and each badge keeps its own.
+    sentence = "Python 3.13 was released on October 7, 2023 and added an experimental JIT compiler."
+    both = tuple(replace(claim, excerpt=sentence) for claim in CHECK_RESULT.claims)
+    page = render_html(replace(CHECK_RESULT, checked_text=sentence, claims=both))
+    assert page.count("<mark ") == 1
+    assert '<div class="checked"><a class="mark" href="#claim-1"><mark class="refuted" ' in page
+    assert (
+        '</mark></a><a class="badge refuted" href="#claim-1">1</a>'
+        '<a class="badge supported" href="#claim-2">2</a></div>'
+    ) in page
+
+    refuted, supported = CHECK_RESULT.claims
+    unchecked = replace(CHECK_RESULT, claims=(replace(refuted, unchecked=("2024",)), supported))
+    assert '<p class="meta">Not checked: 2024, which the passage also states</p>' in render_html(
+        unchecked
+    )
+
+    older = render_html(replace(CHECK_RESULT, checked_text=""))  # stored before the text was
+    assert "The text" not in older
+    assert '<li id="claim-1">' in older
+
+
+def test_a_fact_checks_page_shows_hostile_text_as_text():
+    hostile = replace(
+        CHECK_RESULT,
+        checked_text=f"See </div></text><img src=x onerror=alert(1)> {CHECK_RESULT.checked_text}",
+        sources=(replace(CHECK_RESULT.sources[0], url="javascript:alert(1)"),),
+    )
+    page = render_html(hostile)
+    assert "<img" not in page
+    assert "See &lt;/div&gt;&lt;/text&gt;&lt;img src=x onerror=alert(1)&gt; Python 3.13" in page
+    assert "javascript:" not in page
+
+
+def test_save_writes_the_annotated_page_of_a_fact_check(tmp_path):
+    paths = save(CHECK_RESULT, tmp_path, run_id=14)
+    assert [path.suffix for path in paths] == [".md", ".json", ".html"]
+    assert '<mark class="refuted"' in paths[2].read_text(encoding="utf-8")
+    assert [path.suffix for path in save(RESULT, tmp_path)] == [".md", ".json"]
+
+
+def test_a_claim_spread_over_several_pieces_gets_one_badge_and_says_why_it_is_unclear():
+    sentence = "Dr. Smith said the U.S. economy grew 3% in 2023."
+    unclear = ClaimCheck(
+        "The U.S. economy grew 3% in 2023.", sentence, "q", problems=("not judged (no JSON)",)
+    )
+    result = replace(CHECK_RESULT, checked_text=sentence, claims=(unclear,), findings=())
+    page = render_html(result)
+    assert page.count('class="badge') == 1
+    assert page.count("<mark ") == 1  # "Dr." and "U.S." end no sentence
+    assert "<p>not judged (no JSON)</p>" in page
+    assert "   - not judged (no JSON)" in render_markdown(result)

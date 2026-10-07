@@ -12,7 +12,7 @@ from scout.monitor.rules import cleared, parse_rule, triggers
 from scout.store import _MIGRATIONS, Store
 from scout.web.fetch import Document, Fetcher, FetchStatus
 from scout.web.search import SearchHit
-from tests.helpers import NOW, Clock
+from tests.helpers import CHECK_RESULT, NOW, Clock
 from tests.helpers import SAMPLE_RESULT as RESULT
 
 
@@ -251,3 +251,22 @@ def test_existing_runs_are_remembered_when_the_database_is_upgraded(tmp_path):
     old.close()
     with Store(path) as store:
         assert [m.claim for m in store.recall("shop sells")] == ["Shop sells it for $1,999"]
+
+
+def test_a_fact_check_remembers_what_pages_state_and_leaves_site_tallies_alone():
+    with Store(":memory:") as store:
+        run_id = store.add_run(CHECK_RESULT)
+        assert store.get_run(run_id) == CHECK_RESULT
+        # The verified quotes with what they state: not the quote set aside, and never the
+        # claims under test.
+        remembered = store.recall("python 3.13 released october 2023 2024 added jit")
+        assert sorted((m.claim, m.quote, m.run_id) for m in remembered) == sorted(
+            (finding.claim, finding.quote, run_id) for finding in CHECK_RESULT.trusted
+        )
+        assert not {m.claim for m in remembered} & {c.claim for c in CHECK_RESULT.claims}
+
+        # Its quotes were chosen for a claim under test: they say little about the sites.
+        assert store.all_sites() == []
+        store.add_run(RESULT)
+        shop = store.site_records(["shop.example"])["shop.example"]
+        assert (shop.findings, shop.verified) == (2, 1)

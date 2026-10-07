@@ -21,7 +21,7 @@ from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.rules import Trigger
 from scout.research.rank import tokenize
 from scout.research.reputation import SITE_FAILURES, SiteRecord
-from scout.research.results import Finding, RunResult, Verdict
+from scout.research.results import CHECK_KIND, Finding, RunResult, Verdict
 from scout.research.verify import quoted_in
 from scout.textutil import fold
 from scout.web.domains import hostname
@@ -740,7 +740,10 @@ def _insert_run(
             source = result.source(finding.source)
             if source is not None:
                 _learn(conn, finding, source.url, result.goal, run_id, result.started_at)
-        if not result.carried_over:  # a carried-over run repeats evidence already counted
+        # A carried-over run repeats evidence already counted. A fact-check's quotes are chosen
+        # for a claim under test, often a false one: whether they hold says more about the claim
+        # and the model's reading than about the site.
+        if not result.carried_over and result.plan.kind != CHECK_KIND:
             _note_findings(conn, result)
     return run_id
 

@@ -98,8 +98,9 @@ def test_selection_skips_failing_sites_and_prefers_reliable_ones():
     failing = SiteRecord("paywall.example", streak=5, last_failure=NOW)
     reliable = SiteRecord("b.example", findings=20, verified=20)
     chosen, warnings = select({"paywall.example": failing, "b.example": reliable})
-    assert chosen == ["b.example", "a.example"]
+    assert chosen == ["a.example", "b.example"]  # in search order: reputation chose, not sorted
     assert "skipped sites that keep failing: paywall.example failed 5 times in a row" in warnings
+    assert select({"b.example": reliable}, limit=1)[0] == ["b.example"]
 
 
 def test_standing_never_makes_an_off_topic_page_relevant():

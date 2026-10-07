@@ -10,6 +10,8 @@ from typing import Any
 
 from scout.web.extract import Offer
 
+CHECK_KIND = "check"  # the plan kind of a fact-check: its findings are evidence on claims
+
 
 class Verdict(StrEnum):
     VERIFIED = "verified"  # the quote was found in the cited source and supports the claim
@@ -21,6 +23,13 @@ class Flag(StrEnum):
     ACCESSORY = "accessory"  # a price that belongs to an accessory, not the product itself
     DOUBTED = "doubted"  # the model saw on the page why the fact may be wrong
     STALE = "stale"  # from a page dated long before the period the goal asks about
+
+
+class Ruling(StrEnum):
+    SUPPORTED = "supported"
+    REFUTED = "refuted"
+    DISPUTED = "disputed"  # verified quotes on both sides
+    UNCLEAR = "unclear"  # no verified quote settles it
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +54,11 @@ class Source:
     def freshest_date(self) -> date | None:
         dates = [d for d in (self.published, self.updated) if d is not None]
         return max(dates) if dates else None
+
+    @property
+    def reading(self) -> tuple[str, str | None, str | None]:
+        """Which page was read, and which version of it (a snippet is known by its text)."""
+        return (self.url, self.content_hash, self.text if self.snippet_only else None)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -145,6 +159,60 @@ class Finding:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimCheck:
+    claim: str  # restated to stand alone
+    excerpt: str  # where the checked text makes it, as written there
+    query: str
+    # Finding numbers (as reports number them): trusted evidence for and against the claim, and
+    # the evidence Scout could not verify.
+    supports: tuple[int, ...] = ()
+    refutes: tuple[int, ...] = ()
+    set_aside: tuple[int, ...] = ()
+    note: str | None = None  # the model's reading of the sources: shown, never ruled on
+    unchecked: tuple[str, ...] = ()  # numbers its passage states that no checked claim carries
+    problems: tuple[str, ...] = ()  # why it may have no evidence: nothing found, not judged
+    caveat: str | None = None  # why its sentence is not marked in the text
+
+    @property
+    def ruling(self) -> Ruling:
+        if self.supports and self.refutes:
+            return Ruling.DISPUTED
+        if self.supports:
+            return Ruling.SUPPORTED
+        return Ruling.REFUTED if self.refutes else Ruling.UNCLEAR
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim": self.claim,
+            "excerpt": self.excerpt,
+            "query": self.query,
+            "ruling": self.ruling.value,
+            "supports": list(self.supports),
+            "refutes": list(self.refutes),
+            "set_aside": list(self.set_aside),
+            "note": self.note,
+            "unchecked": list(self.unchecked),
+            "problems": list(self.problems),
+            "caveat": self.caveat,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClaimCheck:
+        return cls(
+            claim=data["claim"],
+            excerpt=data["excerpt"],
+            query=data["query"],
+            supports=tuple(data.get("supports", [])),
+            refutes=tuple(data.get("refutes", [])),
+            set_aside=tuple(data.get("set_aside", [])),
+            note=data.get("note"),
+            unchecked=tuple(data.get("unchecked", [])),
+            problems=tuple(data.get("problems", [])),
+            caveat=data.get("caveat"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     queries: tuple[str, ...]
     kind: str
@@ -172,6 +240,8 @@ class RunResult:
     warnings: tuple[str, ...] = ()
     carried_over: bool = False  # no page changed since the previous run; its analysis was kept
     rounds: int = 1  # search rounds: more than one in deep research
+    claims: tuple[ClaimCheck, ...] = ()  # a fact-check's claims, ruled on from the findings
+    checked_text: str = ""  # a fact-check's text as checked (cut to fit, a page's title first)
 
     @property
     def trusted(self) -> tuple[Finding, ...]:
@@ -204,6 +274,8 @@ class RunResult:
             "warnings": list(self.warnings),
             "carried_over": self.carried_over,
             "rounds": self.rounds,
+            "claims": [claim.to_dict() for claim in self.claims],
+            "checked_text": self.checked_text,
         }
 
     @classmethod
@@ -227,4 +299,6 @@ class RunResult:
             warnings=tuple(data.get("warnings", [])),
             carried_over=data.get("carried_over", False),
             rounds=data.get("rounds", 1),
+            claims=tuple(ClaimCheck.from_dict(item) for item in data.get("claims", [])),
+            checked_text=data.get("checked_text", ""),
         )

@@ -72,6 +72,60 @@ class Synthesis(BaseModel):
     )
 
 
+class ClaimToCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str = Field(
+        description="One checkable fact the text states, restated to stand alone, every number "
+        "as the text gives it."
+    )
+    excerpt: str = Field(
+        description="The sentence of the text that states it, copied character for character."
+    )
+    query: str = Field(
+        description="A short web-search query that would find an independent source on the claim."
+    )
+
+
+class ClaimList(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claims: list[ClaimToCheck] = Field(
+        description="The most important checkable claims, most important first; empty if the "
+        "text states none."
+    )
+
+
+class ModelEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stance: Literal["supports", "refutes"] = Field(
+        description="supports: the quote states the claim; refutes: the quote states something "
+        "that cannot be true if the claim is."
+    )
+    quote: str = Field(
+        description="The sentence or table row from the source, copied character for character. "
+        "Never paraphrase here."
+    )
+    source: int = Field(ge=1, description="The number of the source the quote was copied from.")
+    says: str = Field(
+        description="What the quote states, in plain words, with only the numbers the quote states."
+    )
+
+
+class Judgment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence: list[ModelEvidence] = Field(
+        default_factory=list,
+        description="Quotes that settle the claim, most direct first; none if no source does.",
+    )
+    note: str = Field(
+        description="One sentence on how the sources bear on the claim, e.g. 'The sources give "
+        "324 m, not 330 m.'"
+    )
+
+
 class Extraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
