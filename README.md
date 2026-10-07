@@ -71,6 +71,82 @@ Every run is stored in `~/.scout/scout.db` and written as Markdown and JSON to
 `~/.scout/reports/`. `scout export FOLDER` writes runs as notes with YAML front matter (Obsidian and
 other Markdown vaults) or, with `--format html`, as self-contained web pages.
 
+## Fact-check
+
+```bash
+scout factcheck "Python 3.13 was released on October 7, 2023. It added a JIT compiler."
+scout factcheck https://example.com/article   # the claims a page makes
+pbpaste | scout factcheck -f -                # or -f answer.txt
+```
+
+Your model lists the checkable claims in the text (`--claims`, at most 6 by default). Scout searches
+for each claim, reads a few pages (`-n`/`--pages`, default 3), and has the model copy the sentences
+that settle it. Each claim is then ruled **supported**, **refuted**, **disputed** (verified quotes
+on both sides) or **unclear**:
+
+```
+Verdict — medium confidence (2 of 3 claims settled, 1 by two or more sites)
+Of 3 claims: 1 supported, 1 refuted, 1 unclear.
+
+1. Refuted (1 site): Python 3.13 was released on October 7, 2023.
+   In the text: "Python 3.13 was released on October 7, 2023."
+   - refutes [1]: "3.13.0 final: Monday, 2024-10-07" (source 3, peps.python.org)
+   - set aside [5]: "Release date: Oct. 7, 2024" (source 1) — the quote does not contain 2023
+   The sources give October 7, 2024.
+2. Unclear: Python 3.13 removed the global interpreter lock by default.
+   - set aside [7]: "In Python 3.13 the GIL was removed from the default build." (source 4) — quote not found in the source
+3. Supported (2 sites): Python 3.13 includes an experimental JIT compiler.
+   - confirms [2]: "Python 3.13 ships an experimental JIT compiler" (source 5, realpython.com)
+   - confirms [3]: "Python 3.13 adds an experimental just-in-time compiler" (source 6, docs.python.org)
+```
+
+- Only claims the text makes are checked: a claim's passage must be in the text word for word
+  (without cutting a word or a number), and each of the claim's numbers must be in it. A version
+  or a name may come from before it, where an "it" refers back ("Python 3.13", "Windows 7"); a
+  list's numbering, or a year traded for an earlier one, may not. Numbers the passage states that
+  no claim carries are listed as `Not checked: …`.
+- A claim that words a negation differently from its sentence (a dropped "not", "It is not true
+  that …" quoted without its start) is still checked, but carries a warning and is never coloured.
+- A quote counts only if it is on the page. A confirming quote must itself state every number of
+  the claim, single digits included ("two" counts as 2); the page's title and date do not count.
+  A page that says 2024 never confirms a claim of 2023, and a "refuting" quote that states every
+  number of the claim is set aside as a misreading. Every ruling can be checked by eye from the
+  quote shown.
+- The ruling comes from the verified quotes, never from the model's verdict. Whether a quote
+  confirms or refutes is the model's reading, shown beside the quote so you can judge it; the
+  model's note is shown only when a verified quote backs it.
+- Confidence is high only when quotes from two or more sites settle every claim. Sites count by
+  domain: docs.python.org and python.org are one site (and every user.github.io page is github.io).
+- When you check a web address, nothing from its site (any subdomain, or the site it redirects
+  to) is read as evidence; independent pages take those places.
+- Over MCP (`research`, `fact_check`, `watch_run`), Scout reads only the public internet. The
+  address each connection actually reaches is checked on the socket, before anything is sent, so
+  no spelling of an address, DNS answer or redirect leads to a private network (localhost,
+  10.0.0.0/8, 169.254.169.254, ...); pages cached by the command line from such places are not
+  reused; no page runs in a browser; and proxies from the environment are not used. The command
+  line reads private addresses: you may be checking your own intranet page.
+- The text goes only to your model, but each claim is searched for on your search engine
+  (`SCOUT_SEARCH`), so the claims leave your machine as search queries.
+- `-f` reads UTF-8, with or without a BOM, and UTF-16 with a BOM (PowerShell's `>`, Notepad's
+  "Unicode"). Other encodings: save the file as UTF-8.
+
+Every saved check also writes an **annotated page** (`Annotated page: ….html`): your text with each
+claim's sentence coloured by its ruling (a sentence holding several claims takes the most serious,
+so green means every claim in it held up). A sentence is coloured only when it surely belongs to
+the claim: its passage is whole sentences, found once, with no warning; other claims are told on
+their cards alone. A colour covers what the claims in a sentence say, not every word of it.
+Hovering shows the claims and the quotes that decided them; tapping a sentence or its badge opens
+the claim's card with every quote, its page and date, and why any quote was set aside. `--json`
+lists the saved files under `saved`. It
+is one HTML file with no scripts or external assets, readable in light and dark mode, to send to
+anyone. `scout export FOLDER --run ID --format html` writes it again.
+
+A check is stored like a run (`scout history`, `scout show`, `scout export`). The `[n]` numbers
+work with `scout rate`. Memory (`scout ask`) learns what the pages state, never the claim under
+test. Checks do not change the sites' quote records, and pages are read in search order, so asking
+a finished check again builds the same prompts: with the exchange backend or a recorded answer it
+costs no model time.
+
 ## Watches
 
 ```bash
@@ -127,9 +203,9 @@ trust again.
 
 ## Use it from an AI assistant (MCP)
 
-`scout mcp` serves Scout's tools over MCP (stdio): `research` (optionally deep), `recall`,
-`report`, `watch_add`, `watch_list`, `watch_run`, `watch_trend`, `watch_changes`. Every result
-carries the quotes and pages behind it.
+`scout mcp` serves Scout's tools over MCP (stdio): `research` (optionally deep), `fact_check`,
+`recall`, `report`, `watch_add`, `watch_list`, `watch_run`, `watch_trend`, `watch_changes`. Every
+result carries the quotes and pages behind it, so an assistant can `fact_check` its own draft.
 
 ```bash
 claude mcp add scout -- scout mcp                      # Claude Code
