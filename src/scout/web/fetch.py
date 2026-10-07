@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import queue
+import re
+import socket
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -15,14 +18,18 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Protocol
+from urllib.parse import urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from scout.clock import utcnow
 from scout.errors import ExtractionError, RenderError
 from scout.settings import DEFAULT_USER_AGENT
 from scout.textutil import looks_like_junk
-from scout.web.domains import DEFAULT_SKIP_DOMAINS, hostname, matches_any
+from scout.web.domains import DEFAULT_SKIP_DOMAINS, hostname, matches_any, private_address
 from scout.web.extract import (
     EXTRACTOR_VERSION,
     Extracted,
@@ -49,6 +56,7 @@ class FetchStatus(StrEnum):
     SERVER_ERROR = "server_error"  # 5xx
     TIMEOUT = "timeout"
     NETWORK_ERROR = "network_error"
+    REFUSED = "refused"  # on a private network, when only public pages may be read
     UNSUPPORTED = "unsupported"  # a content type or file we cannot read
     TOO_LARGE = "too_large"
     JUNK = "junk"  # decoded to binary garbage
@@ -145,6 +153,11 @@ class FetchConfig:
     fresh_for: float = 3600.0  # reuse a cached page this many seconds without asking the server
     failed_fresh_for: float = 600.0  # transient failures are retried sooner
     skip_domains: frozenset[str] = DEFAULT_SKIP_DOMAINS
+    public_only: bool = False  # refuse hosts on private networks, redirect hops included
+
+
+# A backslash, a space or a control character makes URL parsers disagree on the host.
+_AMBIGUOUS = re.compile(r"[\\\x00-\x20\x7f]")
 
 
 class _BodyTooLarge(Exception):
@@ -153,6 +166,53 @@ class _BodyTooLarge(Exception):
 
 class _BodyTooSlow(Exception):
     pass
+
+
+class _PrivateHop(Exception):
+    def __init__(self, url: str | None, address: str) -> None:
+        super().__init__(address)
+        self.url = url  # None: refused at the socket, wherever the address came from
+        self.address = address
+
+
+class _PublicPeer:
+    """Refuses a connection whose peer is not on the public internet. Checked on the socket
+    itself, so no spelling of an address, no second DNS answer and no redirect gets through,
+    and nothing is sent before the check."""
+
+    def _new_conn(self) -> socket.socket:
+        sock: socket.socket = super()._new_conn()  # type: ignore[misc]
+        address = ipaddress.ip_address(str(sock.getpeername()[0]).split("%")[0])
+        unwrapped = getattr(address, "ipv4_mapped", None) or address
+        if not unwrapped.is_global:
+            sock.close()
+            raise _PrivateHop(None, str(unwrapped))
+        return sock
+
+
+class _PublicHTTPConnection(_PublicPeer, HTTPConnection):
+    pass
+
+
+class _PublicHTTPSConnection(_PublicPeer, HTTPSConnection):
+    pass
+
+
+class _PublicHTTPPool(HTTPConnectionPool):
+    ConnectionCls = _PublicHTTPConnection
+
+
+class _PublicHTTPSPool(HTTPSConnectionPool):
+    ConnectionCls = _PublicHTTPSConnection
+
+
+class _PublicAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": _PublicHTTPPool,
+            "https": _PublicHTTPSPool,
+        }
 
 
 class Fetcher:
@@ -172,6 +232,8 @@ class Fetcher:
         self._clock = clock
         self._sleep = sleep
         self._renderer = renderer  # reads pages whose text only appears after their scripts run
+        # Checked before each redirect is followed, so a private hop is never requested.
+        self._hooks = {"response": _refuse_private_hop} if self._config.public_only else {}
         self._idle: queue.SimpleQueue[requests.Session] = queue.SimpleQueue()
         self._sessions: list[requests.Session] = []
         self._sessions_lock = threading.Lock()
@@ -197,14 +259,21 @@ class Fetcher:
                 fetched_at=now,
                 error="site only serves paywalled or login pages to scripts",
             )
+        if self._config.public_only:
+            if _AMBIGUOUS.search(url):
+                return _refused(url, "its address is ambiguous", now)
+            if (address := private_address(url)) is not None:
+                return _private(url, _PrivateHop(url, address), now)
         cached = self._cache.get_page(url) if self._cache is not None else None
+        if self._config.public_only and cached is not None and _landed_privately(cached):
+            cached = None  # read earlier by a fetcher that may read private pages
         if cached is not None and cached.ok and cached.extractor != EXTRACTOR_VERSION:
             cached = None  # read by an older extractor: download and read it again
         if cached is not None and self._is_fresh(cached, now):
             return replace(cached, from_cache=True)
 
         doc = self._download(url, cached, now)
-        if self._cache is not None:
+        if self._cache is not None and doc.status is not FetchStatus.REFUSED:
             self._cache.put_page(doc)
         return doc
 
@@ -266,6 +335,10 @@ class Fetcher:
             session = self._idle.get_nowait()
         except queue.Empty:
             session = requests.Session()
+            if self._config.public_only:
+                session.trust_env = False  # a proxy would hide which host is reached
+                for scheme in ("http://", "https://"):
+                    session.mount(scheme, _PublicAdapter())
             # Accept-Encoding is left to urllib3, which only offers br/zstd when it can decode them.
             session.headers.update(
                 {
@@ -290,7 +363,11 @@ class Fetcher:
                     self._sleep(min(4.0, 0.75 * 2 ** (attempt - 1)))
                 try:
                     with session.get(
-                        url, headers=headers, timeout=self._config.timeout, stream=True
+                        url,
+                        headers=headers,
+                        timeout=self._config.timeout,
+                        stream=True,
+                        hooks=self._hooks,
                     ) as resp:
                         if resp.status_code == 304 and cached is not None:
                             return replace(cached, fetched_at=now, from_cache=True)
@@ -306,6 +383,8 @@ class Fetcher:
                         )
                         if status is not FetchStatus.SERVER_ERROR:
                             return failure
+                except _PrivateHop as hop:
+                    return _private(url, hop, now)
                 except requests.TooManyRedirects:
                     return Document(
                         url=url,
@@ -414,6 +493,32 @@ def _status_for_http(code: int) -> FetchStatus | None:
     if code >= 500:
         return FetchStatus.SERVER_ERROR
     return FetchStatus.HTTP_ERROR
+
+
+def _refuse_private_hop(response: requests.Response, *args: Any, **kwargs: Any) -> None:
+    if response.is_redirect:
+        target = urljoin(response.url, response.headers["location"])
+        address = private_address(target)
+        if address is not None:
+            raise _PrivateHop(target, address)
+
+
+def _landed_privately(doc: Document) -> bool:
+    return bool(doc.final_url) and private_address(doc.final_url or "") is not None
+
+
+def _private(url: str, hop: _PrivateHop, now: datetime) -> Document:
+    if hop.url is None:
+        why = f"it leads to a private network ({hop.address})"
+    elif hop.url == url:
+        why = f"it is on a private network ({hop.address})"
+    else:
+        why = f"it redirects to {hop.url}, which is on a private network ({hop.address})"
+    return _refused(url, why, now)
+
+
+def _refused(url: str, why: str, now: datetime) -> Document:
+    return Document(url=url, status=FetchStatus.REFUSED, fetched_at=now, error=f"not read: {why}")
 
 
 def _revalidation_headers(cached: Document | None) -> dict[str, str]:

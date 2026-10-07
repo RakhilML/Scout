@@ -1,4 +1,6 @@
+import http.server
 import importlib.util
+import threading
 import time
 from dataclasses import replace
 
@@ -9,10 +11,11 @@ import responses
 from urllib3.response import HTTPResponse
 
 from scout.errors import ConfigError, RenderError
+from scout.store import Store
 from scout.web.extract import EXTRACTOR_VERSION
 from scout.web.fetch import Document, FetchConfig, Fetcher, FetchStatus
 from scout.web.render import make_renderer
-from tests.helpers import Clock, make_pdf
+from tests.helpers import NOW, Clock, make_pdf
 
 URL = "https://site.example/article"
 ARTICLE = (
@@ -307,3 +310,68 @@ def test_document_round_trips_through_dict(clock):
     )
     doc = make_fetcher(clock).fetch(URL)
     assert Document.from_dict(doc.to_dict()) == doc
+
+
+@responses.activate
+@pytest.mark.parametrize("location", ["http://10.0.0.5/admin", "//10.0.0.5/admin"])
+def test_a_public_only_fetcher_never_requests_a_private_host(location):
+    public = "http://93.184.216.34/a"
+    responses.add(responses.GET, public, status=302, headers={"Location": location})
+    fetcher = Fetcher(FetchConfig(public_only=True))
+    hop = fetcher.fetch(public)
+    direct = fetcher.fetch("http://127.0.0.1:1234/v1/models")
+
+    assert (hop.status, direct.status) == (FetchStatus.REFUSED, FetchStatus.REFUSED)
+    assert hop.error == (
+        "not read: it redirects to http://10.0.0.5/admin, which is on a private network (10.0.0.5)"
+    )
+    assert [call.request.url for call in responses.calls] == [public]
+
+
+def test_the_socket_itself_must_lead_to_the_public_internet(monkeypatch):
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        fetcher = Fetcher(FetchConfig(public_only=True, retries=0))
+        ambiguous = fetcher.fetch(f"http://127.0.0.1:{port}\\@unresolvable.invalid/x")
+        # As if DNS had said "public" to the check and "127.0.0.1" to the connection.
+        monkeypatch.setattr("scout.web.fetch.private_address", lambda url: None)
+        rebound = fetcher.fetch(f"http://127.0.0.1:{port}/admin")
+    finally:
+        server.shutdown()
+    assert ambiguous.error == "not read: its address is ambiguous"
+    assert (rebound.status, rebound.error) == (
+        FetchStatus.REFUSED,
+        "not read: it leads to a private network (127.0.0.1)",
+    )
+    assert seen == []
+
+
+@responses.activate
+def test_a_public_only_fetcher_skips_a_cached_page_that_landed_privately():
+    public = "http://93.184.216.34/a"
+    responses.add(responses.GET, public, body=b"<p>" + b"public text " * 40 + b"</p>")
+    with Store(":memory:") as store:
+        store.put_page(
+            Document(
+                url=public,
+                status=FetchStatus.OK,
+                fetched_at=NOW,
+                final_url="http://169.254.169.254/latest/meta-data/",
+                text="secret",
+            )
+        )
+        doc = Fetcher(FetchConfig(public_only=True), cache=store, clock=Clock()).fetch(public)
+    assert (doc.from_cache, "secret" in doc.text) == (False, False)

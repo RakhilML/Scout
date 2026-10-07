@@ -1,3 +1,5 @@
+import socket
+
 import pytest
 
 from scout.web.domains import (
@@ -6,6 +8,8 @@ from scout.web.domains import (
     hostname,
     is_ad_link,
     matches_any,
+    private_address,
+    registrable_domain,
 )
 
 
@@ -67,3 +71,49 @@ def test_canonical_url_keeps_meaningful_parameters():
 )
 def test_ad_links_are_recognized(url, is_ad):
     assert is_ad_link(url) is is_ad
+
+
+@pytest.mark.parametrize(
+    ("host", "domain"),
+    [
+        ("docs.python.org", "python.org"),
+        ("peps.python.org", "python.org"),
+        ("python.org", "python.org"),
+        ("news.bbc.co.uk", "bbc.co.uk"),
+        ("abc.net.au", "abc.net.au"),
+        ("foo.example.co", "example.co"),
+        ("someone.github.io", "github.io"),
+        ("93.184.216.34", "93.184.216.34"),
+        ("::1", "::1"),
+    ],
+)
+def test_subdomains_belong_to_the_domain_they_were_registered_under(host, domain):
+    assert registrable_domain(host) == domain
+
+
+@pytest.mark.parametrize(
+    ("url", "address"),
+    [
+        ("http://127.0.0.1:1234/v1/models", "127.0.0.1"),
+        ("http://169.254.169.254/latest/meta-data/", "169.254.169.254"),
+        ("http://10.0.0.5/admin", "10.0.0.5"),
+        ("http://[::1]:8080/", "::1"),
+        ("http://[::ffff:127.0.0.1]/", "127.0.0.1"),
+        ("https://93.184.216.34/", None),
+    ],
+)
+def test_addresses_off_the_public_internet_are_found(url, address):
+    assert private_address(url) == address
+
+
+def test_a_name_is_judged_by_the_addresses_it_resolves_to(monkeypatch):
+    assert private_address("http://localhost:9/") in {"127.0.0.1", "::1"}
+
+    def resolve(host, port):
+        if host != "router.example":
+            raise socket.gaierror("no such host")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    assert private_address("http://router.example/") == "192.168.1.1"
+    assert private_address("http://nowhere.example/") is None  # its fetch fails anyway
