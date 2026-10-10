@@ -32,6 +32,15 @@ class Ruling(StrEnum):
     UNCLEAR = "unclear"  # no verified quote settles it
 
 
+def ruling_of(supported: bool, refuted: bool) -> Ruling:
+    """A claim's ruling from the sides its trusted evidence is on."""
+    if supported and refuted:
+        return Ruling.DISPUTED
+    if supported:
+        return Ruling.SUPPORTED
+    return Ruling.REFUTED if refuted else Ruling.UNCLEAR
+
+
 @dataclass(frozen=True, slots=True)
 class Source:
     index: int  # the number the model sees ("Source 3")
@@ -49,6 +58,8 @@ class Source:
     content_hash: str | None = None
     offers: tuple[Offer, ...] = ()
     error: str | None = None
+    copy_of: int | None = None  # an archived copy, read in place of cited page [n], unreadable
+    moved_from: int | None = None  # the live page that cited page [n], dead, moved to
 
     @property
     def freshest_date(self) -> date | None:
@@ -74,6 +85,8 @@ class Source:
             "content_hash": self.content_hash,
             "offers": [offer.to_dict() for offer in self.offers],
             "error": self.error,
+            "copy_of": self.copy_of,
+            "moved_from": self.moved_from,
         }
         if self.snippet_only:
             data["snippet"] = self.text
@@ -95,6 +108,8 @@ class Source:
             content_hash=data.get("content_hash"),
             offers=tuple(Offer.from_dict(item) for item in data.get("offers", [])),
             error=data.get("error"),
+            copy_of=data.get("copy_of"),
+            moved_from=data.get("moved_from"),
         )
 
 
@@ -114,6 +129,7 @@ class Finding:
     availability: str | None = None  # a structured offer's schema.org availability ("InStock")
     flag: Flag | None = None
     note: str | None = None
+    anchor: str | None = None  # where the quote is on its page: a text directive, for links
 
     @property
     def trusted(self) -> bool:
@@ -136,6 +152,7 @@ class Finding:
             "availability": self.availability,
             "flag": self.flag.value if self.flag else None,
             "note": self.note,
+            "anchor": self.anchor,
         }
 
     @classmethod
@@ -155,6 +172,7 @@ class Finding:
             availability=data.get("availability"),
             flag=Flag(data["flag"]) if data.get("flag") else None,
             note=data.get("note"),
+            anchor=data.get("anchor"),
         )
 
 
@@ -172,14 +190,15 @@ class ClaimCheck:
     unchecked: tuple[str, ...] = ()  # numbers its passage states that no checked claim carries
     problems: tuple[str, ...] = ()  # why it may have no evidence: nothing found, not judged
     caveat: str | None = None  # why its sentence is not marked in the text
+    pages: tuple[int, ...] = ()  # the sources it was judged on (Source.index), in reading order
+    kept: bool = False  # carried over from the last run: its pages read the same, so not judged
+    # The claim judged on archived copies of its cited pages that are gone: what they said then,
+    # shown beside its label and never ruling.
+    archived: ClaimCheck | None = None
 
     @property
     def ruling(self) -> Ruling:
-        if self.supports and self.refutes:
-            return Ruling.DISPUTED
-        if self.supports:
-            return Ruling.SUPPORTED
-        return Ruling.REFUTED if self.refutes else Ruling.UNCLEAR
+        return ruling_of(bool(self.supports), bool(self.refutes))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +213,9 @@ class ClaimCheck:
             "unchecked": list(self.unchecked),
             "problems": list(self.problems),
             "caveat": self.caveat,
+            "pages": list(self.pages),
+            "kept": self.kept,
+            "archived": self.archived.to_dict() if self.archived is not None else None,
         }
 
     @classmethod
@@ -209,6 +231,9 @@ class ClaimCheck:
             unchecked=tuple(data.get("unchecked", [])),
             problems=tuple(data.get("problems", [])),
             caveat=data.get("caveat"),
+            pages=tuple(data.get("pages", [])),
+            kept=data.get("kept", False),
+            archived=ClaimCheck.from_dict(data["archived"]) if data.get("archived") else None,
         )
 
 
@@ -242,6 +267,11 @@ class RunResult:
     rounds: int = 1  # search rounds: more than one in deep research
     claims: tuple[ClaimCheck, ...] = ()  # a fact-check's claims, ruled on from the findings
     checked_text: str = ""  # a fact-check's text as checked (cut to fit, a page's title first)
+    cited: bool = False  # a cite-check: each claim judged only on the pages its sentence cites
+    audit: bool = False  # a cite-check of every cited sentence, not of the first few claims
+    skipped: tuple[str, ...] = ()  # an audit's cited sentences in which no claim was checked
+    unread: tuple[str, ...] = ()  # an audit's cited sentences after it stopped at its limit
+    cites: dict[int, str] = field(default_factory=dict)  # a cite-check's [n]: the address it cites
 
     @property
     def trusted(self) -> tuple[Finding, ...]:
@@ -276,6 +306,11 @@ class RunResult:
             "rounds": self.rounds,
             "claims": [claim.to_dict() for claim in self.claims],
             "checked_text": self.checked_text,
+            "cited": self.cited,
+            "audit": self.audit,
+            "skipped": list(self.skipped),
+            "unread": list(self.unread),
+            "cites": {str(n): url for n, url in self.cites.items()},
         }
 
     @classmethod
@@ -301,4 +336,9 @@ class RunResult:
             rounds=data.get("rounds", 1),
             claims=tuple(ClaimCheck.from_dict(item) for item in data.get("claims", [])),
             checked_text=data.get("checked_text", ""),
+            cited=data.get("cited", False),
+            audit=data.get("audit", False),
+            skipped=tuple(data.get("skipped", [])),
+            unread=tuple(data.get("unread", [])),
+            cites={int(n): url for n, url in data.get("cites", {}).items()},
         )

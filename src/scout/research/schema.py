@@ -96,6 +96,17 @@ class ClaimList(BaseModel):
     )
 
 
+# An audit's list: ClaimList's "most important first" would contradict the audit's prompt. (A
+# docstring here would reach the model as the schema's description.)
+class AllClaims(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claims: list[ClaimToCheck] = Field(
+        description="Every checkable claim made in a sentence that carries a marker, in the order "
+        "of the text; empty if there is none."
+    )
+
+
 class ModelEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

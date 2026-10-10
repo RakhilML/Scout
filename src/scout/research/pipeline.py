@@ -9,7 +9,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -18,6 +18,7 @@ from scout.clock import utcnow
 from scout.errors import (
     AnswerPending,
     ContextOverflow,
+    FetchError,
     LLMError,
     ScoutError,
     SearchError,
@@ -26,12 +27,13 @@ from scout.errors import (
 )
 from scout.llm.base import Backend, Message
 from scout.llm.structured import StructuredMode, generate
-from scout.research import factcheck, prompts
+from scout.research import citations, factcheck, prompts
 from scout.research.plan import heuristic_plan, model_plan
-from scout.research.rank import coverage, pack
+from scout.research.rank import coverage, pack, split_chunks
 from scout.research.reputation import SiteBook, SiteRecord
 from scout.research.results import CHECK_KIND, Finding, Flag, Plan, RunResult, Source
 from scout.research.schema import (
+    AllClaims,
     ClaimList,
     ClaimToCheck,
     Extraction,
@@ -42,6 +44,8 @@ from scout.research.schema import (
 from scout.research.values import attach_amounts, flag_values, offer_findings
 from scout.research.verify import assess, verify
 from scout.textutil import clean, fold, shorten
+from scout.web import moved, soft404
+from scout.web.archive import Archive, Snapshot, in_archive, working
 from scout.web.domains import (
     canonical_url,
     hostname,
@@ -49,7 +53,7 @@ from scout.web.domains import (
     private_address,
     registrable_domain,
 )
-from scout.web.fetch import Document, Fetcher
+from scout.web.fetch import Document, Fetcher, FetchStatus
 from scout.web.search import SearchBackend, SearchHit, merge_hits
 
 log = logging.getLogger(__name__)
@@ -67,6 +71,7 @@ _MAX_PER_SITE = 2
 _STALE_KINDS = ("news", "release")  # goals about what is new; a price page's date says little
 _RECENCY_DAYS = {"day": 1, "week": 7, "month": 31, "year": 366}
 PIN_TTL = timedelta(days=1)  # a run still waiting a day after it first waited reads the web again
+_CITED_BATCH = 12  # cited pages read under one fetch deadline
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +87,7 @@ class ResearchOptions:
     structured_mode: StructuredMode = StructuredMode.PROMPT
     reasoning_options: tuple[str, ...] = ()
     public_only: bool = False  # a caller a web page may have steered: no private addresses
+    find_moved: bool = False  # a cite-check searches the sites of a dead page for where it moved
 
 
 class Pins(Protocol):
@@ -104,6 +110,7 @@ class Researcher:
         sites: SiteBook | None = None,
         pins: Pins | None = None,
         pin_scope: str = "",
+        archive: Archive | None = None,
     ) -> None:
         self._search_backend = search
         self._fetcher = fetcher
@@ -113,9 +120,31 @@ class Researcher:
         self._sites = sites  # what earlier runs learned about sites; None: nothing
         self._pins = pins
         self._pin_scope = pin_scope  # who runs it (a watch): runs of one goal pin apart
+        self._archive = archive  # where a cite-check looks up copies of dead pages; None: nowhere
         self._reads: dict[str, Any] = {}  # what this run read, kept if it must wait for an answer
+        self._kept: set[str] = set()  # keys of _reads that are in the store
+        self._resumable = False  # the run keeps what it reads however it stops
         self._run_key = ""
+        self._asked = 0  # model requests made, to tell whether a check asked anything
+        # A check's archived copies, by the citation number they stand in for, with why each
+        # gives no evidence; the lookups it made; and why the archive stopped answering.
+        self._copies: dict[int, tuple[Source | None, str | None]] = {}
+        self._looked_up = 0
+        self._archive_down: str | None = None
+        # Where each cited address led; the live page each dead one moved to, by its number;
+        # and why the search engine stopped answering.
+        self._landed: dict[str, str] = {}
+        self._moves: dict[int, Document | None] = {}
+        self._search_down: str | None = None
+        self._avoid: frozenset[str] = frozenset()  # the checked page's sites: never evidence
+        self._cited_on: datetime | None = None  # when the checked page was written
+        self._progress: Callable[[str], None] = _quiet
         self.structured_mode = self._options.structured_mode  # may drop to PROMPT during a run
+
+    @property
+    def asked(self) -> int:
+        """Model requests made so far."""
+        return self._asked
 
     def run(
         self, goal: str, *, plan: Plan | None = None, reuse: RunResult | None = None
@@ -152,22 +181,34 @@ class Researcher:
             )
         return self._analyze(goal, plan, sources, started, warnings)
 
-    def _pinned(self, goal: str, mode: str, work: Callable[[], RunResult]) -> RunResult:
+    def _pinned(
+        self, goal: str, mode: str, work: Callable[[], RunResult], *, resumable: bool = False
+    ) -> RunResult:
         """Do *work*, keeping what it read while it waits for a model answer: started again, the
-        run reads the same pages on the same day, so its prompts (and their answers) match."""
-        self._reads = {}
+        run reads the same pages on the same day, so its prompts (and their answers) match.
+
+        A *resumable* run keeps what it read and was told when it stops for the model (an error,
+        a wait), an interrupt or a crash, so that started again it continues where it stopped.
+        It keeps the model's answers, so another model starts it afresh. Stopped for anything
+        else (a page that could not be read), it keeps nothing: started again, it reads again.
+        """
+        self._reads, self._kept, self._resumable = {}, set(), resumable
         scope = [goal, mode, self._pin_scope, self._options.public_only]
+        if resumable:
+            scope.append(self._backend.model)
         self._run_key = json.dumps(scope, ensure_ascii=False)
         if self._pins is None:
             return work()
         self._pins.drop_pins(self._run_key, before=self._clock() - PIN_TTL)
         try:
             result = work()
-        except AnswerPending:
-            self._pins.put_pins(self._run_key, self._reads, self._clock())
-            raise
-        except Exception:
-            self._pins.drop_pins(self._run_key)
+        except BaseException as exc:
+            if resumable and (isinstance(exc, LLMError) or not isinstance(exc, ScoutError)):
+                self._keep()
+            elif isinstance(exc, AnswerPending):
+                self._pins.put_pins(self._run_key, self._reads, self._clock())
+            elif isinstance(exc, Exception):
+                self._pins.drop_pins(self._run_key)
             raise
         self._pins.drop_pins(self._run_key)
         return result
@@ -175,7 +216,20 @@ class Researcher:
     def _pin(self, key: str) -> Any | None:
         if self._pins is None:
             return None
-        return self._pins.get_pin(self._run_key, key, newer_than=self._clock() - PIN_TTL)
+        pinned = self._pins.get_pin(self._run_key, key, newer_than=self._clock() - PIN_TTL)
+        if pinned is not None:
+            self._kept.add(key)
+        return pinned
+
+    def _keep(self) -> None:
+        """Store what a resumable run read and was told since it last did: a run that dies
+        before it can say so keeps it too. What is stored already is not written again."""
+        if not self._resumable or self._pins is None:
+            return
+        new = {key: value for key, value in self._reads.items() if key not in self._kept}
+        if new:
+            self._pins.put_pins(self._run_key, new, self._clock())
+            self._kept.update(new)
 
     def _started(self) -> datetime:
         pinned = self._pin("started")
@@ -333,7 +387,16 @@ class Researcher:
             return _warn(result, f"kept the first round's answer: the final one failed ({exc})")
         return replace(result, answer=clean(synthesis.answer), finished_at=self._clock())
 
-    def check(self, subject: str, *, max_claims: int = factcheck.MAX_CLAIMS) -> RunResult:
+    def check(
+        self,
+        subject: str,
+        *,
+        max_claims: int = factcheck.MAX_CLAIMS,
+        reuse: RunResult | None = None,
+        cited: bool = False,
+        audit: bool = False,
+        progress: Callable[[str], None] | None = None,
+    ) -> RunResult:
         """Fact-check a text, or the page at a web address, claim by claim.
 
         The model lists the claims and quotes pages on each. Scout keeps only the claims the
@@ -342,113 +405,383 @@ class Researcher:
 
         With the public_only option (callers a web page may have steered, such as an assistant
         over MCP) an address on a private network is refused rather than read.
+
+        *reuse*, an earlier check of the same text (a claim watch's last run), keeps the claims
+        steady: they are not listed again, and a claim whose pages read exactly as they did then
+        keeps its evidence without asking the model.
+
+        *cited* makes it a cite-check: each claim is judged only on the pages its sentence
+        cites, so the question is whether the text's own sources say it. Nothing is searched.
+        A web page cites what its links and footnotes lead to on other sites.
+
+        *audit* (with *cited*) checks every cited sentence rather than the first few claims,
+        however long the text: its claims are listed a part at a time, and up to AUDIT_LIMIT
+        are judged. An audit keeps what it read and judged however it stops, so the same audit
+        started again within a day continues where it stopped. *progress* hears of each part
+        listed and each claim checked. With *reuse*, an earlier audit (a citation watch's last
+        run), the claims of sentences still in the text are kept, only the parts holding a new
+        or edited cited sentence are listed, and a claim whose cited pages read as they did
+        then keeps its evidence.
         """
+        if audit and not cited:
+            raise ValueError("an audit is a cite-check: it needs cited=True")
         subject = clean(subject)
         if not subject:
             raise ScoutError("nothing to check")
         return self._pinned(
             hashlib.sha256(subject.encode()).hexdigest(),
-            f"check:{max_claims}",
-            lambda: self._check(subject, max_claims),
+            "audit" if audit else f"{'cite' if cited else 'check'}:{max_claims}",
+            lambda: self._check(
+                subject,
+                max_claims,
+                None if cited and not audit else reuse,
+                cited,
+                audit,
+                progress or _quiet,
+            ),
+            resumable=audit,
         )
 
-    def _check(self, subject: str, max_claims: int) -> RunResult:
+    def _check(
+        self,
+        subject: str,
+        max_claims: int,
+        reuse: RunResult | None,
+        cited: bool,
+        audit: bool,
+        progress: Callable[[str], None],
+    ) -> RunResult:
         started = self._started()
         today = started.date()
         warnings: list[str] = []
-        text, page = self._subject(subject)
-        claims, planner, text, set_aside = self._claims(text, today, max_claims, warnings)
+        self._copies, self._looked_up, self._archive_down = {}, 0, None
+        self._landed, self._moves, self._search_down = {}, {}, None
+        self._progress = progress
+        text, page = self._subject(subject, links=cited)
+        # A dead page's copy from before the page citing it was last written, when it says
+        # when: what its author read, not what the address held later.
+        written = (page.updated or page.published) if page is not None else None
+        self._cited_on = datetime.combine(written, time.max, UTC) if written else None
+        origin = (subject, page.final_url or "") if page is not None else ()
+        avoid = frozenset(registrable_domain(host) for host in map(hostname, origin) if host)
+        self._avoid = avoid
+        pages: dict[int, str] = {}
+        if cited:
+            text, pages, clashes = citations.cited(text, own=avoid)
+            if not pages:
+                raise ScoutError(citations.NONE_CITED if page is None else citations.NONE_LINKED)
+            warnings.extend(clashes)
+        asked = self._asked
+        covered = factcheck.Coverage()
+        if audit:
+            if reuse is not None and not reuse.audit:
+                reuse = None
+            title = page.title if page is not None else None
+            prose = text[: factcheck.back_matter(text)] if page is not None else text
+            if len(prose) < len(text):
+                heading = text[len(prose) :].split("\n", 1)[0].strip("# ")
+                warnings.append(f'the page\'s back matter, from "{heading}" on, was not audited')
+            claims, planner, set_aside, covered = self._audit_claims(
+                prose, pages, title, today, warnings, progress, reuse
+            )
+        elif (
+            reuse is not None
+            and reuse.plan.kind == CHECK_KIND
+            and reuse.claims
+            and reuse.checked_text == text
+        ):
+            claims = [
+                ClaimToCheck(claim=c.claim, excerpt=c.excerpt, query=c.query) for c in reuse.claims
+            ]
+            planner, set_aside = reuse.plan.planner, 0
+        else:
+            reuse = None
+            claims, planner, text, set_aside = self._claims(
+                text, today, max_claims, warnings, cited=cited
+            )
+        if cited and not audit:
+            claims, uncited = factcheck.citing(claims, text, pages)
+            claims = claims[:max_claims]
+            warnings.extend(uncited)
+            if (partial := factcheck.partly_checked(claims, text, pages)) is not None:
+                warnings.append(partial)
         plan = Plan(
-            queries=tuple(claim.query for claim in claims),
+            queries=() if cited else tuple(claim.query for claim in claims),
             kind=CHECK_KIND,
             recency=None,
             planner=planner,
         )
-        origin = (subject, page.final_url or "") if page is not None else ()
-        avoid = frozenset(registrable_domain(host) for host in map(hostname, origin) if host)
         sources: list[Source] = []
+        if cited and reuse is not None:
+            # Every cited page at once, in parallel: a run judging nothing takes no longer.
+            every = {
+                n: pages[n]
+                for claim in claims
+                for n in _cited_pages(claim, text, pages)[: factcheck.MAX_CITED_PAGES]
+            }
+            self._read_cited(every, sources, warnings)
         weighed = []
+        notes: dict[str, list[int]] = {}
         for number, claim in enumerate(claims, start=1):
+            self._keep()
             log.info("checking claim %d of %d", number, len(claims))
+            progress(f"claim {number} of {len(claims)}")
             noted: list[str] = []
-            searched = replace(plan, queries=(claim.query,))
-            item = self._check_claim(claim, searched, avoid, sources, today, noted)
+            if cited:
+                item = self._check_cited(claim, text, pages, sources, today, noted, reuse)
+            else:
+                searched = replace(plan, queries=(claim.query,))
+                item = self._check_claim(claim, searched, avoid, sources, today, noted, reuse)
             weighed.append(item._replace(caveat=factcheck.caveat(claim, text)))
-            warnings.extend(f"claim {number}: {warning}" for warning in noted)
+            for note in noted:
+                notes.setdefault(note, []).append(number)
+        warnings.extend(_per_claim(notes))
+        if cited and (kept := sum(item.kept for item in weighed)):
+            warnings.append(
+                f"{kept} of {len(claims)} claims kept their evidence: the pages they cite read "
+                "as they did in the last run"
+            )
         findings, checks = factcheck.assemble(weighed)
-        answer, confidence = factcheck.summarize(checks, findings, sources, set_aside=set_aside)
+        answer, confidence = factcheck.summarize(
+            checks, findings, sources, set_aside=set_aside, cited=cited, skipped=covered.unchecked
+        )
+        if checks and covered.line:
+            answer = f"{answer} {covered.line}"
         named = subject if page is not None else shorten(" ".join(text.split()), 80)
+        kind = "citation audit" if audit else "cite-check" if cited else "fact-check"
         return RunResult(
-            goal=f"fact-check: {named}",
+            goal=f"{kind}: {named}",
             started_at=started,
             finished_at=self._clock(),
             model=self._backend.model,
             plan=plan,
-            sources=tuple(sources),
+            sources=tuple(sorted(sources, key=lambda source: source.index)),
             answer=answer,
             findings=tuple(findings),
             confidence=confidence,
             warnings=tuple(warnings),
+            carried_over=(
+                reuse is not None and any(item.kept for item in weighed) and self._asked == asked
+            ),
             claims=tuple(checks),
             checked_text=text,
+            cited=cited,
+            audit=audit,
+            skipped=covered.skipped,
+            unread=covered.unread,
+            cites=pages,
         )
 
-    def _subject(self, subject: str) -> tuple[str, Document | None]:
+    def _subject(self, subject: str, *, links: bool) -> tuple[str, Document | None]:
         """The text to check, and the page it comes from when *subject* is a web address: that
-        page is read once and pinned, like the pages a run reads."""
-        if not subject.startswith(("http://", "https://")) or len(subject.split()) > 1:
+        page is read once and pinned, like the pages a run reads. With *links*, its text keeps
+        the links and notes it cites. A page that answers but is gone (soft404) is not read."""
+        if not factcheck.web_address(subject):
             return subject, None
         public_only = self._options.public_only
         if public_only:
             _refuse_private(subject)
         pinned = self._pin("subject")
-        page = (
-            Document.from_dict(pinned)
-            if pinned
-            else self._fetcher.fetch_many([subject], deadline=self._options.fetch_deadline)[0]
-        )
+        if pinned:
+            page = Document.from_dict(pinned)
+        else:
+            deadline = self._options.fetch_deadline
+            read = self._fetcher.fetch_many([subject], deadline=deadline, links=links)
+            (page,) = soft404.screened(self._fetcher, read, deadline=deadline, links=links)
         if public_only and page.final_url:
             _refuse_private(page.final_url)
-        self._reads["subject"] = page.to_dict()
         if not page.ok or not page.text:
             reason = page.error or page.status.value.replace("_", " ")
             raise ScoutError(f"could not read {subject}: {reason}")
+        self._reads["subject"] = page.to_dict()
         text = page.text
         if page.title and not fold(text).startswith(fold(page.title)):
             text = f"{page.title}\n\n{text}"
         return clean(text), page
 
     def _claims(
-        self, text: str, today: date, max_claims: int, warnings: list[str]
+        self, text: str, today: date, max_claims: int, warnings: list[str], *, cited: bool = False
     ) -> tuple[list[ClaimToCheck], str, str, int]:
         """The claims to check, who chose them (the model, or the heuristic of checking every
         sentence when the model's list is unusable), the text as checked (cut to what fits the
-        model's context window), and how many listed claims the text does not make."""
+        model's context window), and how many listed claims the text does not make. For a
+        cite-check there may be more: those its sentences cite no page for are dropped later."""
         budget = source_budget(self._options.context_tokens)
         whole = len(text)
         try:
             try:
-                text, listed = self._listed(text, today, max_claims, budget)
+                text, listed = self._listed(text, today, max_claims, budget, cited)
             except ContextOverflow:
                 # Token estimates are approximate; the server's verdict wins. One smaller retry.
-                text, listed = self._listed(text, today, max_claims, int(budget * 0.6))
+                text, listed = self._listed(text, today, max_claims, int(budget * 0.6), cited)
         except StructuredOutputError as exc:
             warnings.append(
                 "checked the text sentence by sentence: "
                 f"the model's list of claims was unusable ({exc})"
             )
-            text = _cut(text[:budget], whole, warnings)
-            return factcheck.sentences(text, max_claims), "heuristic", text, 0
-        claims, set_aside = factcheck.anchored(listed.claims, text, max_claims)
+            text = _cut(text[:budget], whole, warnings, cited=cited)
+            return factcheck.sentences(text, None if cited else max_claims), "heuristic", text, 0
+        limit = factcheck.CLAIM_LIMIT if cited else max_claims
+        claims, set_aside = factcheck.anchored(listed.claims, text, limit, cited=cited)
         warnings.extend(set_aside)
-        return claims, "model", _cut(text, whole, warnings), len(set_aside)
+        return claims, "model", _cut(text, whole, warnings, cited=cited), len(set_aside)
 
     def _listed(
-        self, text: str, today: date, max_claims: int, budget: int
+        self, text: str, today: date, max_claims: int, budget: int, cited: bool
     ) -> tuple[str, ClaimList]:
         text = text[:budget]
-        messages = prompts.claims_messages(text, today, max_claims=max_claims)
+        messages = prompts.claims_messages(text, today, max_claims=max_claims, cited=cited)
         return text, self._generate(messages, ClaimList, purpose="claims")
+
+    def _audit_claims(
+        self,
+        text: str,
+        pages: Mapping[int, str],
+        title: str | None,
+        today: date,
+        warnings: list[str],
+        progress: Callable[[str], None],
+        reuse: RunResult | None,
+    ) -> tuple[list[ClaimToCheck], str, int, factcheck.Coverage]:
+        """An audit's claims: every claim the model lists in the sentences of *text* citing
+        *pages*, a part at a time, in the order of the text and at most AUDIT_LIMIT. Also who
+        listed them, how many it listed that the text does not make, and what they cover.
+
+        Listing stops once AUDIT_LIMIT claims, or cited sentences, are listed. A part whose
+        list is unusable is checked sentence by sentence; the others still count as the model's.
+
+        With *reuse*, an earlier audit, its claims still made in *text* are kept where they
+        stand, and only parts holding a cited sentence it did not know are listed, keeping the
+        claims of those sentences: the model is never asked to list a sentence again.
+        """
+        cut = factcheck.parts(text, pages, source_budget(self._options.context_tokens))
+        limit = factcheck.AUDIT_LIMIT
+        earlier, known = (
+            factcheck.kept_claims(reuse, text, pages) if reuse is not None else ([], set())
+        )
+        todo = [
+            number
+            for number, (_, _, part) in enumerate(cut, start=1)
+            if any(
+                factcheck.addressed(sentence, pages) not in known
+                for sentence in factcheck.cited_sentences(part, pages)
+            )
+        ]
+        found: list[ClaimToCheck] = []
+        seen: set[tuple[str, tuple[int, ...]]] = set()
+        kept = listed = set_aside = upto = 0
+        planner = reuse.plan.planner if reuse is not None and earlier else "heuristic"
+
+        def add(claims: Sequence[ClaimToCheck]) -> list[ClaimToCheck]:
+            new = []
+            for claim in claims:
+                key = (fold(claim.claim), factcheck.cited_by(text, claim.excerpt))
+                if key not in seen:
+                    seen.add(key)
+                    new.append(claim)
+            found.extend(new)
+            return new
+
+        for number, (_, end, part) in enumerate(cut, start=1):
+            if max(kept, listed) >= limit:
+                break
+            folded = fold(part)
+            here = [factcheck.place(folded, claim.excerpt) is not None for claim in earlier]
+            kept += len(add([c for c, inside in zip(earlier, here, strict=True) if inside]))
+            earlier = [c for c, inside in zip(earlier, here, strict=True) if not inside]
+            if number in todo:
+                numbered = (number, len(cut)) if len(cut) > 1 else None
+                new = "new " if reuse is not None else ""
+                progress(f"listing {new}claims: part {todo.index(number) + 1} of {len(todo)}")
+                self._keep()
+                try:
+                    claims = self._part_claims(part, pages, numbered, title, today, warnings)
+                except StructuredOutputError as exc:
+                    warnings.append(
+                        f"{_in_part(numbered)}checked the cited sentences as written: "
+                        f"the model's list of claims was unusable ({exc})"
+                    )
+                    claims, _ = factcheck.citing(factcheck.sentences(part), part, pages)
+                else:
+                    planner = "model"
+                    claims, aside = factcheck.anchored(claims, text, len(claims), cited=True)
+                    warnings.extend(aside)
+                    set_aside += len(aside)
+                claims = factcheck.unknown(claims, text, pages, known)
+                kept += len(factcheck.citing(add(claims), text, pages)[0])
+            listed += len(factcheck.cited_sentences(part, pages))
+            upto = end
+        else:
+            upto = len(text)
+            add(earlier)  # a kept claim whose passage runs across two parts
+        claims, uncited = factcheck.citing(found, text, pages)
+        warnings.extend(uncited)
+        folded = fold(text)
+        claims.sort(key=lambda claim: (factcheck.place(folded, claim.excerpt) or (len(folded),))[0])
+        stopped = None
+        if upto < len(text):
+            what = "claims" if kept >= limit else "cited sentences"
+            stopped = f"its limit of {limit} {what}"
+        elif len(claims) > limit:
+            stopped = f"its limit of {limit} claims"
+        claims = claims[:limit]
+        covered = factcheck.coverage(claims, text, pages, upto=upto, stopped=stopped)
+        return claims, planner, set_aside, covered
+
+    def _part_claims(
+        self,
+        part: str,
+        pages: Mapping[int, str],
+        numbered: tuple[int, int] | None,
+        title: str | None,
+        today: date,
+        warnings: list[str],
+    ) -> list[ClaimToCheck]:
+        """The claims the model lists in one part of an audited text. A part the server finds
+        too long is listed again in smaller pieces; a piece too long even so is told, and its
+        sentences go unchecked."""
+        try:
+            return self._listed_part(part, pages, numbered, title, today)
+        except ContextOverflow:
+            # Token estimates are approximate; the server's verdict wins.
+            budget = int(source_budget(self._options.context_tokens) * 0.6)
+            pieces = factcheck.parts(part, pages, budget)
+        claims: list[ClaimToCheck] = []
+        for _, _, piece in pieces:
+            try:
+                claims += self._listed_part(piece, pages, numbered, title, today)
+            except ContextOverflow:
+                warnings.append(
+                    f"{_in_part(numbered)}a passage of {len(piece):,} characters did not fit the "
+                    "model's context window: its cited sentences were not checked"
+                )
+        return claims
+
+    def _listed_part(
+        self,
+        part: str,
+        pages: Mapping[int, str],
+        numbered: tuple[int, int] | None,
+        title: str | None,
+        today: date,
+    ) -> list[ClaimToCheck]:
+        """The model's list of every cited claim in *part*: pinned, so a resumed audit does
+        not ask for it again."""
+        key = _pin_key("listed", part)
+        listed = self._pin(key)
+        if listed is None:
+            messages = prompts.claims_messages(
+                part,
+                today,
+                max_claims=2 * len(factcheck.cited_sentences(part, pages)),
+                cited=True,
+                every=True,
+                part=numbered,
+                title=title,
+            )
+            listed = self._generate(messages, AllClaims, purpose="claims").model_dump()
+        self._reads[key] = listed
+        return AllClaims.model_validate(listed).claims
 
     def _check_claim(
         self,
@@ -458,31 +791,356 @@ class Researcher:
         sources: list[Source],
         today: date,
         warnings: list[str],
+        reuse: RunResult | None,
     ) -> factcheck.Weighed:
         """Search and read for one claim, leaving out the sites *avoid*, then weigh the quotes
-        the model finds on its pages. The pages join *sources*, the run's, keeping their number
-        if an earlier claim read them. A reply that is unusable leaves this claim unclear; a
-        model that is down or still to answer stops the check."""
+        the model finds on its pages, unless *reuse* weighed the same pages already. The pages
+        join *sources*, the run's, keeping their number if an earlier claim read them. A reply
+        that is unusable leaves this claim unclear (and judged again next time); a model that is
+        down or still to answer stops the check."""
         try:
             found = self._read(claim.claim, plan, warnings, avoid=avoid)
         except SearchError as exc:
             warnings.append(str(exc))
             return factcheck.Weighed(claim, [], [], None, (str(exc),))
         found = factcheck.renumber(found, sources)
+        kept = factcheck.carried(claim, reuse, found) if reuse is not None else None
+        if kept is not None:
+            warnings.append("no page changed since the last check; its evidence was kept")
+            return kept
         try:
             judgment = self._judge(claim.claim, found, today, warnings)
         except StructuredOutputError as exc:
-            warnings.append(f"not judged ({exc})")
-            return factcheck.Weighed(claim, [], [], None, (f"not judged ({exc})",))
+            unjudged = f"{factcheck.NOT_JUDGED} ({exc})"
+            warnings.append(unjudged)
+            return factcheck.Weighed(claim, [], [], None, (unjudged,))
         supports, refutes = factcheck.weigh(claim.claim, judgment, found)
         problems = (factcheck.NOTHING_READ,) if factcheck.NOTHING_READ in warnings else ()
-        return factcheck.Weighed(claim, supports, refutes, clean(judgment.note) or None, problems)
+        note = clean(judgment.note) or None
+        pages = tuple(source.index for source in found)
+        return factcheck.Weighed(claim, supports, refutes, note, problems, pages=pages)
+
+    def _check_cited(
+        self,
+        claim: ClaimToCheck,
+        text: str,
+        pages: Mapping[int, str],
+        sources: list[Source],
+        today: date,
+        warnings: list[str],
+        reuse: RunResult | None,
+    ) -> factcheck.Weighed:
+        """Weigh the quotes the model finds for one claim on the pages its sentence cites, and
+        on no other page, so that a quote can count only for a page the text cites for it. A
+        claim none of whose pages could be read costs no model request, nor does one whose
+        pages read as they did for *reuse*, an earlier audit: it keeps its evidence. With an
+        archive, a claim citing a dead page is also judged on the copies of its dead pages, so
+        that each dead citation can be replaced by a copy proven to back it, or by the live page
+        it moved to, proven to hold the same quote.
+
+        A sentence citing many pages is judged on the first few: a page, which chooses its
+        own links, must not make one claim read hundreds of pages."""
+        cites = _cited_pages(claim, text, pages)
+        if len(cites) > factcheck.MAX_CITED_PAGES:
+            warnings.append(
+                f"its sentence cites {len(cites)} pages; "
+                f"it was judged on the first {factcheck.MAX_CITED_PAGES}"
+            )
+            cites = cites[: factcheck.MAX_CITED_PAGES]
+        found = self._read_cited({n: pages[n] for n in cites}, sources, warnings)
+        problems = tuple(_unread(source) for source in found if source.snippet_only)
+        kept = factcheck.carried(claim, reuse, found) if reuse is not None else None
+        if kept is not None:
+            return kept._replace(problems=problems)
+        weighed = self._weighed(claim, found, cites, problems, today, warnings)
+        if self._archive is not None:
+            copies = self._on_copies(claim, found, pages, sources, today, warnings)
+            weighed = weighed._replace(archived=copies)
+        return weighed
+
+    def _weighed(
+        self,
+        claim: ClaimToCheck,
+        found: Sequence[Source],
+        on: tuple[int, ...],
+        problems: tuple[str, ...],
+        today: date,
+        warnings: list[str],
+    ) -> factcheck.Weighed:
+        """*claim* weighed on *found*, the pages numbered *on*, and on no other page; none
+        that could be read, no model request. A reply that is unusable leaves it not judged."""
+        readable = sum(1 for source in found if not source.snippet_only)
+        if not readable:
+            return factcheck.Weighed(claim, [], [], None, problems, pages=on)
+        # A page cited alone may fill the context window, not a page's usual share of it.
+        share = source_budget(self._options.context_tokens) // readable
+        per_source = max(self._options.max_source_chars, share)
+        try:
+            judgment = self._judged(claim.claim, found, today, warnings, per_source)
+        except StructuredOutputError as exc:
+            unjudged = f"{factcheck.NOT_JUDGED} ({exc})"
+            warnings.append(unjudged)
+            return factcheck.Weighed(claim, [], [], None, (*problems, unjudged), pages=on)
+        supports, refutes = factcheck.weigh(claim.claim, judgment, found)
+        note = clean(judgment.note) or None
+        return factcheck.Weighed(claim, supports, refutes, note, problems, pages=on)
+
+    def _on_copies(
+        self,
+        claim: ClaimToCheck,
+        found: Sequence[Source],
+        pages: Mapping[int, str],
+        sources: list[Source],
+        today: date,
+        warnings: list[str],
+    ) -> factcheck.Weighed | None:
+        """*claim* judged on the archive's newest working copies of the pages among *found*
+        (those it cites) that are gone, and on no page that could be read: what they said when
+        archived, never what they say now. None when no page it cites is gone.
+
+        A dead page whose copy backs the claim is looked for where it moved; the quote that
+        backed it on the copy, verified again on the live page found, backs it there too, and
+        that page joins the run's sources. It is not one of the pages the claim was judged on."""
+        dead = [page for page in found if factcheck.gone(page)]
+        if not dead:
+            return None
+        copies, problems = [], []
+        for page in dead:
+            copy, problem = self._copy(page, pages, sources, warnings)
+            copies += [(page, copy)] if copy is not None else []
+            problems += [problem] if problem is not None else []
+        on = tuple(copy.index for _, copy in copies)
+        read = [copy for _, copy in copies]
+        weighed = self._weighed(claim, read, on, tuple(problems), today, warnings)
+        on_live = []
+        for page, copy in copies:
+            backing = [f for f in weighed.supports if f.trusted and f.source == copy.index]
+            if not backing:
+                continue
+            live = self._moved(page, copy, backing[0].quote, pages, sources, warnings)
+            if live is None:
+                continue
+            again = factcheck.found_again(claim.claim, backing[0], live)
+            if again is not None:
+                on_live.append(again)
+                if all(source.index != live.index for source in sources):
+                    sources.append(live)
+        return weighed._replace(supports=[*weighed.supports, *on_live])
+
+    def _moved(
+        self,
+        page: Source,
+        copy: Source,
+        quote: str,
+        pages: Mapping[int, str],
+        sources: Sequence[Source],
+        warnings: list[str],
+    ) -> Source | None:
+        """The live page that *page*, a dead cited page whose archived *copy* backs a claim with
+        *quote*, moved to, as a source numbered after every other (or None): proven by what it
+        holds (web/moved), never by its address. It is looked for once a run, and searched for
+        only with the find_moved option, until the search engine fails. A site that no longer
+        resolves sent the page nowhere."""
+        n = page.index
+        known = next((source for source in sources if source.moved_from == n), None)
+        if known is not None:
+            return known
+        if page.status == FetchStatus.NETWORK_ERROR:
+            return None
+        if n not in self._moves:
+            self._moves[n] = self._relocated(page, copy, quote, warnings)
+        found = self._moves[n]
+        if found is None:
+            return None
+        address = found.final_url or found.url
+        hit = SearchHit(
+            url=address, title=copy.title, snippet="", rank=1, query=f"new address of [{n}]"
+        )
+        (read,) = _sources([hit], [found])
+        index = max([*pages, *(source.index for source in sources)]) + 1
+        return replace(read, index=index, moved_from=n)
+
+    def _relocated(
+        self, page: Source, copy: Source, quote: str, warnings: list[str]
+    ) -> Document | None:
+        """Where *page* moved, read: pinned like a page (whether it was searched for, too), so
+        a resumed audit searches and reads nothing again; a search that failed is not."""
+        search_too = self._options.find_moved and self._search_down is None
+        key = _pin_key("moved", [canonical_url(page.url), search_too])
+        lookup = self._reads.get(key) or self._pin(key)
+        if lookup is None:
+            self._progress(f"looking for where [{page.index}] moved")
+            try:
+                found = moved.relocate(
+                    self._fetcher,
+                    self._search_backend,
+                    url=page.url,
+                    landed=self._landed.get(page.url),
+                    copy_text=copy.text,
+                    quote=quote,
+                    own=self._avoid,
+                    region=self._options.region,
+                    deadline=self._options.fetch_deadline,
+                    search_too=search_too,
+                )
+            except SearchError as exc:
+                self._search_down = str(exc)
+                warnings.append(
+                    f"the search engine did not answer ({exc}): later dead pages were not looked "
+                    "for at new addresses"
+                )
+                return None
+            lookup = {"document": found.to_dict() if found is not None else None}
+        self._reads[key] = lookup
+        return Document.from_dict(lookup["document"]) if lookup["document"] else None
+
+    def _copy(
+        self, page: Source, pages: Mapping[int, str], sources: list[Source], warnings: list[str]
+    ) -> tuple[Source | None, str | None]:
+        """The archive's copy of *page*, a dead cited page, as a source of the run numbered after
+        every citation (or None), and why it gives no evidence (or None). A page is looked up
+        only if factcheck.archivable allows it, once a run; at most ARCHIVE_LIMIT pages are, and
+        none after the archive failed to answer. A lookup is pinned like a page, so a resumed
+        check judges the very same copy; a failed one is not."""
+        n = page.index
+        if not factcheck.archivable(page):
+            why = "it is an archived copy already" if in_archive(page.url) else "no public name"
+            return None, factcheck.not_looked_up(n, why)
+        if n in self._copies:
+            return self._copies[n]
+        key = _pin_key("archived", canonical_url(page.url))
+        lookup = self._reads.get(key)  # looked up already, for this page under another number
+        if lookup is None:
+            limit = factcheck.ARCHIVE_LIMIT
+            if self._looked_up >= limit:
+                why = f"at most {limit} cited pages are looked up in a run"
+                return None, factcheck.not_looked_up(n, why)
+            lookup = self._pin(key)
+            if lookup is None and self._archive is not None and self._archive_down is None:
+                self._progress(f"looking up [{n}] on the Wayback Machine")
+                try:
+                    lookup = _lookup(self._archive, page.url, before=self._cited_on)
+                except FetchError as exc:
+                    self._archive_down = str(exc)
+                    warnings.append(
+                        f"the Wayback Machine did not answer ({exc}): later unreadable cited "
+                        "pages were not looked up"
+                    )
+            if lookup is None:
+                why = f"the Wayback Machine did not answer ({self._archive_down})"
+                return None, factcheck.not_looked_up(n, why)
+            self._looked_up += 1
+            self._reads[key] = lookup
+        if lookup["snapshot"] is None:
+            self._copies[n] = None, factcheck.no_copy(n)
+            return self._copies[n]
+        snapshot = Snapshot(lookup["snapshot"][0], datetime.fromisoformat(lookup["snapshot"][1]))
+        hit = SearchHit(
+            url=snapshot.page, title=page.title, snippet="", rank=1, query=f"archived copy of [{n}]"
+        )
+        (read,) = _sources([hit], [Document.from_dict(lookup["document"])])
+        index = max([*pages, *(source.index for source in sources)]) + 1
+        copy = replace(read, index=index, site=page.site, copy_of=n)
+        sources.append(copy)
+        problem = None
+        if copy.snippet_only:
+            problem = f"could not read the archived copy of [{n}] ({factcheck.why_unread(copy)})"
+        self._copies[n] = copy, problem
+        return self._copies[n]
+
+    def _read_cited(
+        self, cited: Mapping[int, str], sources: list[Source], warnings: list[str]
+    ) -> list[Source]:
+        """The pages *cited* (by their citation numbers), each read once a run: a page read
+        for an earlier claim is not read again, even under another number. A page that answers
+        but is gone (soft404) reads as not found. What is read is pinned like a search's pages,
+        so a resumed check judges the very same pages, and probes no site again."""
+        known = {source.index: source for source in sources}
+        by_url = {
+            source.url: source
+            for source in sources
+            if source.copy_of is None and source.moved_from is None
+        }
+        new = {n: url for n, url in cited.items() if n not in known and url not in by_url}
+        if new:
+            listed = json.dumps(list(new.items()))
+            key = "cited:" + hashlib.sha256(listed.encode("utf-8")).hexdigest()[:16]
+            pinned = self._pin(key)
+            if pinned is None:
+                # A few pages at a time, each batch with its own deadline: hundreds of cited
+                # pages under one would leave the last abandoned, run after run.
+                urls = list(dict.fromkeys(new.values()))
+                deadline = self._options.fetch_deadline
+                fetched: list[Document] = []
+                for start in range(0, len(urls), _CITED_BATCH):
+                    batch = urls[start : start + _CITED_BATCH]
+                    answered = self._fetcher.fetch_many(batch, deadline=deadline)
+                    fetched += soft404.screened(self._fetcher, answered, deadline=deadline)
+                read = dict(zip(urls, fetched, strict=True))
+                pinned = [read[url].to_dict() for url in new.values()]
+            self._reads[key] = pinned
+            hits = [
+                SearchHit(url=url, title=url, snippet="", rank=rank, query=f"cited as [{n}]")
+                for rank, (n, url) in enumerate(new.items(), start=1)
+            ]
+            documents = [Document.from_dict(document) for document in pinned]
+            self._landed.update(
+                (url, document.final_url)
+                for url, document in zip(new.values(), documents, strict=True)
+                if document.final_url
+            )
+            for n, source in zip(new, _sources(hits, documents), strict=True):
+                known[n] = by_url[source.url] = replace(source, index=n)
+                sources.append(known[n])
+                if source.snippet_only:
+                    warnings.append(_unread(known[n]))
+        for n, url in cited.items():
+            if n not in known:
+                known[n] = replace(by_url[url], index=n, query=f"cited as [{n}]")
+                sources.append(known[n])
+        return [known[n] for n in cited]
+
+    def _judged(
+        self,
+        claim: str,
+        sources: Sequence[Source],
+        today: date,
+        warnings: list[str],
+        per_source: int,
+    ) -> Judgment:
+        """The model's judgment of *claim* on the cited *sources*. A resumable run pins it, with
+        what judging it noted, so that started again it asks nothing again for this claim: the
+        judgment is weighed as before, and rules the same."""
+        if not self._resumable:
+            return self._judge(claim, sources, today, warnings, per_source=per_source)
+        key = _pin_key("judged", [claim, [source.reading for source in sources], per_source])
+        judged = self._pin(key)
+        if judged is None:
+            noted: list[str] = []
+            judgment = self._judge(claim, sources, today, noted, per_source=per_source)
+            judged = {"judgment": judgment.model_dump(), "warnings": noted}
+        self._reads[key] = judged
+        warnings.extend(judged["warnings"])
+        return Judgment.model_validate(judged["judgment"])
 
     def _judge(
-        self, claim: str, sources: Sequence[Source], today: date, warnings: list[str]
+        self,
+        claim: str,
+        sources: Sequence[Source],
+        today: date,
+        warnings: list[str],
+        *,
+        per_source: int | None = None,
     ) -> Judgment:
+        """The model's judgment of *claim* on *sources*. With *per_source*, a page may fill
+        more of the budget than its usual share, and a page sent only in part even so is told:
+        what it says of the claim may be in the part left out."""
+        partly: list[str] = []
+
         def ask(budget: int) -> tuple[Judgment, int]:
-            blocks, left_out = self._blocks(claim, sources, budget)
+            packed = self._packed(claim, sources, budget, per_source)
+            partly[:] = _partly_sent(sources, packed)
+            blocks, left_out = _fenced(sources, packed)
             if not blocks:
                 warnings.append(factcheck.NOTHING_READ)
                 return Judgment(note=""), left_out
@@ -491,7 +1149,10 @@ class Researcher:
             )
             return self._generate(messages, Judgment, purpose="judge"), left_out
 
-        return self._fitted(ask, warnings)
+        judgment = self._fitted(ask, warnings)
+        if per_source is not None:
+            warnings.extend(partly)
+        return judgment
 
     def _analyze(
         self,
@@ -631,26 +1292,25 @@ class Researcher:
         self, goal: str, query: str, sources: Sequence[Source], today: date, budget: int
     ) -> tuple[Extraction, int]:
         """The model's extraction, and how many readable pages the budget had to leave out."""
-        blocks, left_out = self._blocks(query, sources, budget)
+        blocks, left_out = _fenced(sources, self._packed(query, sources, budget))
         if not blocks:
             return Extraction(answer="None of the sources could be read.", findings=[]), left_out
         messages = prompts.extract_messages(goal, today, blocks, max_findings=MAX_FINDINGS)
         return self._generate(messages, Extraction, purpose="extract"), left_out
 
-    def _blocks(self, query: str, sources: Sequence[Source], budget: int) -> tuple[list[str], int]:
-        """The passages most relevant to *query* that fit *budget*, fenced for the prompt
-        source by source, and how many readable pages did not fit."""
-        packed = pack(
+    def _packed(
+        self, query: str, sources: Sequence[Source], budget: int, per_source: int | None = None
+    ) -> dict[int, list[str]]:
+        """The passages of each source most relevant to *query* that fit *budget*."""
+        return pack(
             [(source.index, source.text) for source in sources if source.text],
             query,
             budget=budget,
-            per_source=self._options.max_source_chars,
+            per_source=per_source or self._options.max_source_chars,
         )
-        left_out = sum(1 for s in sources if not s.snippet_only and s.index not in packed)
-        blocks = [prompts.source_block(s, packed[s.index]) for s in sources if s.index in packed]
-        return blocks, left_out
 
     def _generate(self, messages: list[Message], output: type[T], *, purpose: str) -> T:
+        self._asked += 1
         try:
             return generate(
                 self._backend,
@@ -773,6 +1433,49 @@ def _sources(
     return sources
 
 
+def _fenced(sources: Sequence[Source], packed: Mapping[int, list[str]]) -> tuple[list[str], int]:
+    """The *packed* passages fenced for the prompt source by source, and how many readable
+    pages did not fit."""
+    left_out = sum(1 for s in sources if not s.snippet_only and s.index not in packed)
+    blocks = [prompts.source_block(s, packed[s.index]) for s in sources if s.index in packed]
+    return blocks, left_out
+
+
+def _partly_sent(sources: Sequence[Source], packed: Mapping[int, list[str]]) -> list[str]:
+    told = []
+    for source in sources:
+        sent = packed.get(source.index, [])
+        if sent and len(sent) < len(split_chunks(source.text)):
+            name = f"[{source.index}]"
+            if source.copy_of is not None:  # the text's [n] are its citations
+                name = f"the archived copy of [{source.copy_of}]"
+            told.append(
+                f"{name} is {len(source.text):,} characters; only the passages closest to the "
+                "claim were read"
+            )
+    return told
+
+
+def _unread(source: Source) -> str:
+    """Why a cited page gave no evidence: "could not read [4] example.org (not found: HTTP 404)"."""
+    return f"could not read [{source.index}] {source.site} ({factcheck.why_unread(source)})"
+
+
+def _lookup(archive: Archive, url: str, *, before: datetime | None) -> dict[str, Any]:
+    """The archive's newest working copy of *url* (taken before *before*), read, as a pin keeps
+    it. FetchError when the archive did not answer, or did not serve the copy."""
+    found = working(archive, url, rejected=soft404.error_page, before=before)
+    if found is None:
+        return {"snapshot": None, "document": None}
+    snapshot, document = found
+    return {"snapshot": [snapshot.url, snapshot.taken.isoformat()], "document": document.to_dict()}
+
+
+def _cited_pages(claim: ClaimToCheck, text: str, pages: Mapping[int, str]) -> tuple[int, ...]:
+    """The citation numbers of the web pages a claim's sentence cites, in order."""
+    return tuple(n for n in factcheck.cited_by(text, claim.excerpt) if n in pages)
+
+
 def _without_outlier_flags(findings: Sequence[Finding]) -> list[Finding]:
     """Outliers are judged again once more values are known."""
     return [
@@ -820,10 +1523,35 @@ def _flag_stale(
     return marked
 
 
-def _cut(text: str, whole: int, warnings: list[str]) -> str:
+def _cut(text: str, whole: int, warnings: list[str], *, cited: bool = False) -> str:
     if len(text) < whole:
-        warnings.append(f"only the first {len(text):,} characters were checked")
+        cut = f"only the first {len(text):,} characters were checked"
+        warnings.append(f"{cut}; {factcheck.EVERY_CITED}" if cited else cut)
     return text
+
+
+def _per_claim(notes: Mapping[str, Sequence[int]]) -> list[str]:
+    """Each note on the claims it was made for, once: "claims 4, 9, 12: [3] is 41,200
+    characters; ...". An audit would otherwise repeat a long page's note for every claim
+    citing it."""
+    told = []
+    for note, numbers in notes.items():
+        claims = list(dict.fromkeys(numbers))
+        told.append(f"claim{'s' if len(claims) > 1 else ''} {', '.join(map(str, claims))}: {note}")
+    return told
+
+
+def _quiet(step: str) -> None:
+    """Progress that nobody follows."""
+
+
+def _in_part(numbered: tuple[int, int] | None) -> str:
+    return f"part {numbered[0]} of {numbered[1]}: " if numbered else ""
+
+
+def _pin_key(kind: str, what: Any) -> str:
+    encoded = json.dumps(what, ensure_ascii=False)
+    return f"{kind}:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
 def _independent(
