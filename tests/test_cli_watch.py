@@ -261,10 +261,13 @@ def test_a_citation_watch_is_added_and_shown_with_its_labels_and_dead_pages(work
     assert "4 claims: 2 contradicted, 1 not found, 1 unreadable" in shown
     day = when(NOW, date_only=True)
     assert re.search(r"Not backed\W+label\W+claim\W+cites\W+since\W", shown)
+    # a claim may wrap inside its cell, but its row's first line always holds the cites and date
     assert re.search(
-        rf"contradicted\W+Python 3\.13 was released\W+\[1\] python\.org\W+{day}", shown
+        rf"contradicted\W+Python 3\.13 was released[^\n]*\[1\] python\.org\W+{day}", shown
     )
-    assert re.search(rf"unreadable\W+Python 3\.13 runs on iOS\W+\[4\] example\.org\W+{day}", shown)
+    assert re.search(
+        rf"unreadable\W+Python 3\.13 runs on iOS[^\n]*\[4\] example\.org\W+{day}", shown
+    )
     assert re.search(r"Cited pages that could not be read\W+page\W+why\W+since\W", shown)
     assert re.search(rf"{GONE}\W+not found: HTTP 404\W+{day}", shown)
 
