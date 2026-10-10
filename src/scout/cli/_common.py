@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime
 from typing import Any, get_args
+from urllib.parse import quote
 
 import click
 from rich.console import Console
@@ -19,6 +21,7 @@ EXIT_ANSWER_PENDING = 75  # EX_TEMPFAIL: run the same command again once the ans
 
 KINDS = list(get_args(GoalKind))
 RECENCY = list(get_args(Recency))
+_UNSAFE_IN_LINKS = re.compile(r"[\s\[\]\x00-\x1f\x7f-\x9f]")
 
 out = Console()
 err = Console(stderr=True, soft_wrap=True)  # never break a path in two
@@ -40,6 +43,8 @@ class ScoutGroup(click.Group):
             ctx.exit(EXIT_ANSWER_PENDING)
         except ScoutError as exc:
             err.print(f"[red]error:[/] {escape(str(exc))}")
+            for note in getattr(exc, "__notes__", ()):
+                err.print(escape(note))
             ctx.exit(1)
 
 
@@ -50,6 +55,15 @@ def settings() -> Settings:
 def when(moment: datetime, *, date_only: bool = False) -> str:
     """A stored (UTC) time as the local time people expect."""
     return moment.astimezone().strftime("%Y-%m-%d" if date_only else "%Y-%m-%d %H:%M")
+
+
+def linked(text: str, url: str) -> str:
+    """*text* (markup) as a terminal hyperlink to *url*, when it is a web page. What could end
+    the markup tag or the terminal's link sequence is percent-encoded: a page's address is not
+    to be trusted."""
+    if not url.startswith(("https://", "http://")):
+        return text
+    return f"[link={_UNSAFE_IN_LINKS.sub(lambda found: quote(found[0]), url)}]{text}[/link]"
 
 
 def prepare_streams() -> None:

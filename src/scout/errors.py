@@ -17,6 +17,10 @@ class SearchError(ScoutError):
     """No search backend produced results."""
 
 
+class FetchError(ScoutError):
+    """A page or an API could not be read."""
+
+
 class ExtractionError(ScoutError):
     """Downloaded content could not be turned into text."""
 

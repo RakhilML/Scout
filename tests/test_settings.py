@@ -26,6 +26,12 @@ def test_defaults_without_any_configuration(places):
     assert settings.data_dir == home / ".scout"
     assert settings.reports_dir == home / ".scout" / "reports"
     assert settings.db_path == home / ".scout" / "scout.db"
+    assert settings.archive == "wayback"
+
+
+def test_archive_lookups_can_be_turned_off(places):
+    cwd, home = places
+    assert load_settings(cwd=cwd, home=home, environ={"SCOUT_ARCHIVE": "off"}).archive == "off"
 
 
 def test_env_file_values_and_environment_precedence(places):

@@ -15,6 +15,7 @@ from scout.research.pipeline import Researcher, ResearchOptions
 from scout.research.results import CHECK_KIND, RunResult, Source
 from scout.settings import Settings
 from scout.store import Rating, Store
+from scout.web.archive import check_archive, make_archive
 from scout.web.fetch import FetchConfig, Fetcher
 from scout.web.render import make_renderer
 from scout.web.search import CachedSearch, language_tag, make_search_backend
@@ -31,6 +32,7 @@ class App:
     def __init__(self, settings: Settings, *, llm: str | None = None) -> None:
         self.settings = replace(settings, llm=llm) if llm else settings
         # First what can fail on a bad setting, so nothing is left open when it does.
+        check_archive(self.settings.archive)
         self._search_backend = make_search_backend(
             self.settings.search,
             timeout=self.settings.fetch_timeout,
@@ -62,6 +64,8 @@ class App:
             replace(fetch_config, public_only=True, fresh_for=WATCH_PAGE_FRESHNESS),
             cache=self.store,
         )
+        # Copies of dead cited pages, read as the public internet whoever asks.
+        self.archive = make_archive(self.settings.archive, self.public_fetcher)
         self.watch_search = CachedSearch(
             self._search_backend, self.store, max_age=WATCH_SEARCH_CACHE_SECONDS
         )
@@ -123,11 +127,15 @@ class App:
         fresh: bool = False,
         public_only: bool = False,
         scope: str = "",
+        archive: bool = False,
         **overrides: object,
     ) -> Researcher:
         """A researcher for the configured model; *fresh* uses the watches' fresher caches,
-        *public_only* reads only pages on the public internet, and *scope* names who runs it
-        (a watch), so that runs of one goal resume apart."""
+        *public_only* reads only pages on the public internet, *scope* names who runs it (a
+        watch), so that runs of one goal resume apart, and with *archive* a cite-check judges
+        claims whose cited pages are dead on their archived copies."""
+        if archive and self.archive is None:
+            raise ScoutError("archive lookups are off (SCOUT_ARCHIVE=off)")
         found = self.capabilities()
         options = ResearchOptions(
             max_results=self.settings.max_results,
@@ -145,6 +153,7 @@ class App:
             sites=self.store,
             pins=self.store,
             pin_scope=scope,
+            archive=self.archive if archive else None,
         )
 
     def restore_sources(self, result: RunResult) -> tuple[list[Source], int]:

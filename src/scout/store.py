@@ -12,7 +12,7 @@ import threading
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from scout.research.reputation import SITE_FAILURES, SiteRecord
 from scout.research.results import CHECK_KIND, Finding, RunResult, Verdict
 from scout.research.verify import quoted_in
 from scout.textutil import fold
+from scout.web import fragments
 from scout.web.domains import hostname
 from scout.web.fetch import Document
 from scout.web.search import SearchHit
@@ -193,6 +194,12 @@ _MIGRATIONS: tuple[str, ...] = (
         PRIMARY KEY (run, key)
     );
     """,
+    # 9: where on its page each alert's and each remembered quote is, for links that open the
+    # page at it
+    """
+    ALTER TABLE alerts ADD COLUMN anchor TEXT;
+    ALTER TABLE knowledge ADD COLUMN anchor TEXT;
+    """,
 )
 
 
@@ -233,6 +240,12 @@ class Knowledge:
     run_id: int  # the run that first found it
     first_seen: datetime
     last_seen: datetime
+    anchor: str | None = None  # where the quote was on its page when last seen
+
+    @property
+    def link(self) -> str:
+        """Its page, opening at its quote."""
+        return fragments.link(self.url, self.anchor)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -243,6 +256,7 @@ class Knowledge:
             "run_id": self.run_id,
             "first_seen": self.first_seen.isoformat(),
             "last_seen": self.last_seen.isoformat(),
+            "link": self.link,
         }
 
 
@@ -291,6 +305,12 @@ class AlertRecord:
     quote: str | None  # the evidence, for a fact read from the page's text
     delivered_at: datetime | None
     error: str | None  # why the last delivery failed
+    anchor: str | None = None  # where the quote is on its page
+
+    @property
+    def link(self) -> str:
+        """Its page, opening at its quote."""
+        return fragments.link(self.url, self.anchor)
 
 
 class Store:
@@ -395,6 +415,28 @@ class Store:
             for row in rows
         ]
 
+    def last_readings(self, watch: str, urls: Collection[str]) -> dict[str, Document]:
+        """Each of *urls* as the watch's latest run that read it in full saw it, within the time
+        page versions are kept: one pass over the watch's runs, however many pages."""
+        wanted = set(urls)
+        if not wanted:
+            return {}
+        rows = self._all(
+            "SELECT json_extract(source.value, '$.url') AS url,"
+            " json_extract(source.value, '$.content_hash') AS hash"
+            " FROM runs, json_each(runs.result, '$.sources') AS source"
+            " WHERE runs.scout = ? AND runs.started_at >= ?"
+            " AND json_extract(source.value, '$.content_hash') IS NOT NULL"
+            " ORDER BY runs.started_at DESC, runs.id DESC",
+            (watch, (datetime.now(UTC) - PAGES_KEPT).isoformat()),
+        )
+        latest: dict[str, str] = {}
+        for row in rows:
+            if row["url"] in wanted:
+                latest.setdefault(row["url"], row["hash"])
+        found = {url: self.get_snapshot(content) for url, content in latest.items()}
+        return {url: doc for url, doc in found.items() if doc is not None}
+
     def last_runs(self, watch: str, *, limit: int = 1) -> list[tuple[int, RunResult]]:
         """A watch's latest runs with their ids, newest first."""
         rows = self._all(
@@ -426,6 +468,7 @@ class Store:
                 run_id=row["run_id"],
                 first_seen=datetime.fromisoformat(row["first_seen"]),
                 last_seen=datetime.fromisoformat(row["last_seen"]),
+                anchor=row["anchor"],
             )
             for row in rows
         ]
@@ -594,7 +637,7 @@ class Store:
 
     def _alerts(self, where: str, params: Sequence[Any]) -> list[AlertRecord]:
         rows = self._all(
-            "SELECT id, watch, run_id, created_at, reason, url, quote, delivered_at, error "
+            "SELECT id, watch, run_id, created_at, reason, url, quote, delivered_at, error, anchor "
             f"FROM alerts {where}",
             params,
         )
@@ -609,6 +652,7 @@ class Store:
                 quote=row["quote"],
                 delivered_at=_when(row["delivered_at"]),
                 error=row["error"],
+                anchor=row["anchor"],
             )
             for row in rows
         ]
@@ -738,7 +782,8 @@ def _insert_run(
     if learn:
         for finding in result.trusted:
             source = result.source(finding.source)
-            if source is not None:
+            # Memory is what the web states: an archived copy states what a page said once.
+            if source is not None and source.copy_of is None:
                 _learn(conn, finding, source.url, result.goal, run_id, result.started_at)
         # A carried-over run repeats evidence already counted. A fact-check's quotes are chosen
         # for a claim under test, often a false one: whether they hold says more about the claim
@@ -753,19 +798,22 @@ def _learn(
 ) -> None:
     """Remember a trusted finding, or note that it was seen again. A quote of the same page with
     a little more or less text around it (and the same numbers) is the same finding. One that
-    someone rated wrong stays hidden."""
+    someone rated wrong stays hidden. Where the quote is on its page is taken from the newest
+    reading that placed it."""
+    seen = at.isoformat()
     for row in conn.execute("SELECT id, quote FROM knowledge WHERE url = ?", (url,)):
         if _same_quote(row["quote"], finding.quote):
             conn.execute(  # a resumed run can be older than one kept meanwhile
-                "UPDATE knowledge SET last_seen = max(last_seen, ?) WHERE id = ?",
-                (at.isoformat(), row["id"]),
+                "UPDATE knowledge SET last_seen = max(last_seen, ?), anchor = coalesce("
+                "CASE WHEN ? >= last_seen THEN ? END, anchor) WHERE id = ?",
+                (seen, seen, finding.anchor, row["id"]),
             )
             return
     hidden = _rated_bad(conn, url, finding.quote)
     conn.execute(
-        "INSERT INTO knowledge (url, quote, claim, goal, run_id, first_seen, last_seen, hidden) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (url, finding.quote, finding.claim, goal, run_id, at.isoformat(), at.isoformat(), hidden),
+        "INSERT INTO knowledge (url, quote, claim, goal, run_id, first_seen, last_seen, hidden, "
+        "anchor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (url, finding.quote, finding.claim, goal, run_id, seen, seen, hidden, finding.anchor),
     )
 
 
@@ -867,9 +915,10 @@ def _raise(
     conn: sqlite3.Connection, watch: str, run_id: int, trigger: Trigger, at: datetime
 ) -> int | None:
     fact = trigger.delta.fact
+    gone = trigger.delta.change is Change.GONE  # the quote left its page: nothing to highlight
     cursor = conn.execute(
-        "INSERT INTO alerts (watch, key, run_id, created_at, reason, url, quote, holding)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO alerts (watch, key, run_id, created_at, reason, url, quote, holding, anchor)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
         (
             watch,
             trigger.key,
@@ -879,6 +928,7 @@ def _raise(
             fact.url,
             None if fact.structured else fact.quote,
             int(trigger.rule.is_condition),
+            None if gone else fact.anchor,
         ),
     )
     return cursor.lastrowid if cursor.rowcount else None

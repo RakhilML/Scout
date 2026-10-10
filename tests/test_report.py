@@ -14,10 +14,10 @@ from scout.report import (
     save,
     slug,
 )
-from scout.research.results import ClaimCheck, RunResult
+from scout.research.results import ClaimCheck, Finding, RunResult, Source, Verdict
 from scout.settings import load_settings
 from scout.store import Store
-from tests.helpers import CHECK_RESULT
+from tests.helpers import AUDIT_RESULT, CHECK_RESULT, CITE_RESULT, GONE
 from tests.helpers import SAMPLE_RESULT as RESULT
 
 
@@ -44,6 +44,8 @@ def test_markdown_sources_table_and_footer():
     assert "| 1 | [RTX 5090 \\| Shop](https://shop.example/5090)" in text
     assert "2024-05-20 (updated 2026-07-27)" in text
     assert "| snippet only (blocked) |" in text
+    unread = replace(RESULT.sources[1], text="")
+    assert "| no (blocked) |" in render_markdown(replace(RESULT, sources=(unread,)))
     assert "## Notes\n\n- 1 of 2 pages could not be read" in text
     assert "run 7" in text
     assert "42s" in text
@@ -263,6 +265,72 @@ def test_save_writes_the_annotated_page_of_a_fact_check(tmp_path):
     assert [path.suffix for path in save(RESULT, tmp_path)] == [".md", ".json"]
 
 
+def test_a_cite_check_heads_each_claim_with_what_the_pages_it_cites_said():
+    text = render_markdown(CITE_RESULT, run_id=21)
+    assert (
+        "**Verdict** \N{EM DASH} medium confidence (2 of 4 cited claims settled by the pages they "
+        "cite; 1 cited page could not be read)\n\n"
+        "Of 4 cited claims: 2 contradicted, 1 not found, 1 unreadable."
+    ) in text
+    claims = text.split("## Claims")[1].split("## Sources")[0]
+    assert "1. **Contradicted by [1]** (1 site): Python 3.13 was released on October 7" in claims
+    # [n] is the text's citation: findings are numbered in words
+    assert '   - refutes (finding 1): "Python 3.13.0 was released on October 7, 2024."' in claims
+    assert "2. **Contradicted by [2]** (1 site): Python 3.13 removed the global" in claims
+    assert (
+        "3. **Not found in [3]**: Python 3.13's JIT makes it 40% faster than Python 3.12.\n\n"
+        '   In the text: "Its JIT makes it 40% faster than 3.12 \\[3\\]."\n\n'
+        "   - no quote on the page it cites states or contradicts it"
+    ) in claims
+    assert (
+        "4. **Could not read [4]**: Python 3.13 runs on iOS as a tier 3 platform.\n\n"
+        '   In the text: "It runs on iOS as a tier 3 platform \\[4\\]."\n\n'
+        "   - could not read \\[4\\] example.org (not found: HTTP 404)"
+    ) in claims
+    sources = text.split("## Sources")[1]
+    assert "| 1 | [Python Release Python 3.13.0](" in sources
+    assert "| yes | 2024-10-07 | cited as \\[1\\] |" in sources
+    assert f"| [{GONE}]({GONE}) \N{EM DASH} example.org | no (not found) |  | cited as" in sources
+
+    first, second = CITE_RESULT.claims[:2]
+    backed = replace(
+        CITE_RESULT, claims=(replace(first, refutes=(), supports=(1, 2), pages=(1, 2)),)
+    )
+    assert "1. **Backed by [1, 2]** (1 site): " in render_markdown(backed)
+    disputed = replace(CITE_RESULT, claims=(replace(first, supports=(2,), pages=(1, 2)),))
+    assert "1. **Its sources disagree ([2] backs it, [1] contradicts it)**: " in render_markdown(
+        disputed
+    )
+    both = replace(second, pages=(2, 3, 4), refutes=())
+    assert "1. **Not found in [2, 3]**: " in render_markdown(replace(CITE_RESULT, claims=(both,)))
+
+
+def test_a_cite_checks_page_speaks_of_what_the_cited_pages_said():
+    page = render_html(CITE_RESULT)
+    assert (
+        '<p><span class="ruling supported">backed</span> '
+        '<span class="ruling refuted">contradicted</span> '
+        '<span class="ruling disputed">disputed</span> '
+        '<span class="ruling unclear">not found, unreadable or not judged</span></p>'
+    ) in page
+    assert (
+        '<mark class="refuted" title="Claim 1 (contradicted): Python 3.13 was released on '
+        "October 7, 2023. \N{EM DASH} &quot;Python 3.13.0 was released on October 7, 2024.&quot; "
+        '(python.org)">Python 3.13 was released on October 7, 2023 [1].</mark>'
+    ) in page
+    assert (
+        '<mark class="unclear" title="Claim 4 (unreadable): Python 3.13 runs on iOS as a tier 3 '
+        'platform.">It runs on iOS as a tier 3 platform [4].</mark>'
+    ) in page
+    assert page.count("<mark ") == 4  # "See the docs [2] for more." holds no claim
+    assert (
+        '<li id="claim-3"><p><span class="ruling unclear">Not found in [3]</span>: '
+        "Python 3.13&#x27;s JIT"
+    ) in page
+    assert "<p>could not read [4] example.org (not found: HTTP 404)</p>" in page
+    assert "<td>no (not found)</td>" in page
+
+
 def test_a_claim_spread_over_several_pieces_gets_one_badge_and_says_why_it_is_unclear():
     sentence = "Dr. Smith said the U.S. economy grew 3% in 2023."
     unclear = ClaimCheck(
@@ -274,3 +342,154 @@ def test_a_claim_spread_over_several_pieces_gets_one_badge_and_says_why_it_is_un
     assert page.count("<mark ") == 1  # "Dr." and "U.S." end no sentence
     assert "<p>not judged (no JSON)</p>" in page
     assert "   - not judged (no JSON)" in render_markdown(result)
+
+
+def test_an_audits_report_shows_what_it_did_not_check():
+    text = render_markdown(AUDIT_RESULT)
+    assert (
+        "## Not checked\n\nCited sentences in which no claim was checked:\n\n"
+        '- "See the docs \\[2\\] for more."\n'
+    ) in text
+    assert text.index("## Claims") < text.index("## Not checked") < text.index("## Sources")
+    page = render_html(AUDIT_RESULT)
+    assert (
+        '<span class="skipped" title="not checked: no claim in this cited sentence was '
+        'checked">See the docs [2] for more.</span>'
+    ) in page
+    assert page.count('<span class="skipped" title=') == 1
+    assert (
+        '<span class="ruling unclear">not found, unreadable or not judged</span> '
+        '<span class="skipped">not checked</span></p>'
+    ) in page
+    assert (
+        "<h2>Not checked</h2><p>Cited sentences in which no claim was checked:</p><ul>\n"
+        "<li>See the docs [2] for more.</li>\n</ul>"
+    ) in page
+
+    hostile = replace(AUDIT_RESULT, skipped=("<img src=x> [2]",))
+    assert r'- "\<img src=x\> \[2\]"' in render_markdown(hostile)
+    assert "<li>&lt;img src=x&gt; [2]</li>" in render_html(hostile)
+    for plain in (render_markdown(CITE_RESULT), render_html(CITE_RESULT)):
+        assert "Not checked" not in plain
+        assert 'class="skipped"' not in plain
+
+
+AT_QUOTE = "text=Now%20%241%2C999%20at%20Shop."
+PLACED = replace(
+    RESULT, findings=(replace(RESULT.findings[0], anchor=AT_QUOTE), *RESULT.findings[1:])
+)
+
+
+def test_a_findings_source_link_opens_its_page_at_the_quote():
+    deep = f"https://shop.example/5090#:~:{AT_QUOTE}"
+    text = render_markdown(PLACED)
+    assert f"1. Shop sells it for $1,999 ([source 1]({deep}))" in text
+    assert "3. It ships free ([source 1](https://shop.example/5090))" in text  # not placed
+    assert "| 1 | [RTX 5090 \\| Shop](https://shop.example/5090) " in text
+    assert f"[source 1]({deep})" in render_note(PLACED)
+
+    page = render_html(PLACED)
+    assert f'<a href="{deep}">(source 1)</a><blockquote>' in page
+    assert '<a href="https://shop.example/5090">RTX 5090 | Shop</a>' in page
+    assert "opens its page at the quote, highlighted" in page
+    assert "opens its page at the quote, highlighted" not in render_html(RESULT)
+
+
+def test_a_fact_checks_quotes_link_to_where_they_are_on_their_pages():
+    refuting, confirming, plain, aside = CHECK_RESULT.findings
+    placed = replace(
+        CHECK_RESULT,
+        findings=(
+            replace(refuting, anchor="text=Python%203.13.0%20was"),
+            replace(confirming, anchor="text=Python%203.13%20adds"),
+            plain,
+            replace(aside, anchor="text=Python%203.13%20was"),
+        ),
+    )
+    release = "https://www.python.org/downloads/release/python-3130/"
+    whatsnew = "https://docs.python.org/3/whatsnew/3.13.html"
+    text = render_markdown(placed)
+    claims, sources = text.split("## Sources")
+    assert (
+        f"([source 1]({release}#:~:text=Python%203.13.0%20was), python.org, 2024-10-07)" in claims
+    )
+    assert f"([source 2]({whatsnew}#:~:text=Python%203.13%20was)) \N{EM DASH} the quote" in claims
+    assert f"([source 2]({whatsnew}#:~:text=Python%203.13%20adds), docs.python.org)" in claims
+    assert "([source 3](https://realpython.com/python313-new-features/), realpython.com)" in claims
+    assert "#:~:" not in sources
+
+    cards, table = render_html(placed).split("<h2>Sources</h2>")
+    assert (
+        f'<p>refutes [1] (<a href="{release}#:~:text=Python%203.13.0%20was">source 1</a>, '
+        "python.org, 2024-10-07)</p>"
+    ) in cards
+    assert f'<a href="{whatsnew}#:~:text=Python%203.13%20was">(source 2)</a> &mdash;' in cards
+    assert '<h2>Claims</h2><p class="meta">A source beside a quote opens its page' in cards
+    assert "#:~:" not in table
+
+
+def test_where_a_quote_is_round_trips_and_older_runs_load_without_it():
+    data = json.loads(render_json(PLACED))
+    assert [finding["anchor"] for finding in data["findings"]] == [AT_QUOTE, None, None]
+    del data["run_id"], data["scout_version"]
+    assert RunResult.from_dict(data) == PLACED
+
+    for finding in data["findings"]:
+        del finding["anchor"]
+    older = RunResult.from_dict(data)
+    assert older == RESULT
+    assert render_markdown(older) == render_markdown(RESULT)
+
+
+def test_an_audit_round_trips_and_older_runs_load():
+    data = json.loads(render_json(AUDIT_RESULT))
+    assert (data["audit"], data["skipped"]) == (True, ["See the docs [2] for more."])
+    assert RunResult.from_dict(data) == AUDIT_RESULT
+
+    older = CITE_RESULT.to_dict()
+    del older["audit"], older["skipped"]
+    loaded = RunResult.from_dict(older)
+    assert (loaded.audit, loaded.skipped) == (False, ())
+    assert render_markdown(loaded) == render_markdown(CITE_RESULT)
+    assert render_html(loaded) == render_html(CITE_RESULT)
+
+
+COPY = f"https://web.archive.org/web/20241102083000/{GONE}"
+ON_IOS = "Python 3.13 runs on iOS as a tier 3 platform."
+IOS = CITE_RESULT.claims[3]
+ARCHIVED = replace(
+    CITE_RESULT,
+    sources=(
+        *CITE_RESULT.sources,
+        Source(5, COPY, "Python on phones", "example.org", "ok", "archived copy of [4]", copy_of=4),
+    ),
+    findings=(
+        *CITE_RESULT.findings,
+        Finding(ON_IOS, ON_IOS, 5, Verdict.VERIFIED, anchor="text=Python%203.13%20runs%20on%20iOS"),
+    ),
+    claims=(
+        *CITE_RESULT.claims[:3],
+        replace(IOS, archived=replace(IOS, problems=(), supports=(3,), pages=(5,))),
+    ),
+)
+
+
+def test_a_claims_archived_reading_is_shown_beside_its_label_never_as_it():
+    page = render_html(ARCHIVED)
+    card = page.split('<li id="claim-4">')[1].split("</li>")[0]
+    assert (
+        '<p>could not read [4] example.org (not found: HTTP 404)</p><div class="archived">'
+        "<p>archived copy of [4] (2024-11-02): backed</p><p>confirms (finding 3) "
+        f'(<a href="{COPY}#:~:text=Python%203.13%20runs%20on%20iOS">archived copy of [4]</a>, '
+        "example.org, archived 2024-11-02)</p>"
+    ) in card
+    assert (
+        '<mark class="unclear" title="Claim 4 (unreadable): Python 3.13 runs on iOS as a tier 3 '
+        'platform. \N{EM DASH} archived copy: backed">'
+    ) in page
+    assert '<td>5</td><td><a href="' in page
+    assert "&mdash; example.org, archived copy of [4]</td><td>yes</td>" in page
+
+    sources = render_markdown(ARCHIVED).split("## Sources")[1]
+    assert "\N{EM DASH} example.org | yes |  | archived copy of \\[4\\] |" in sources
+    assert render_markdown(replace(ARCHIVED, claims=CITE_RESULT.claims)).count("archived copy") == 1

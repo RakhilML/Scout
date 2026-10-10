@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "scout"
 dynamic = ["version"]
-description = "Private, verifiable web monitoring with a local LLM: reports only what changed, with a quote behind every claim."
+description = "Private, verifiable web research, fact-checking and monitoring with a local LLM: a quote behind every claim."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,7 @@ dependencies = [
     "requests>=2.32",
     # No hard-coded Accept-Encoding: urllib3 advertises br/zstd only when these decoders are installed.
     "urllib3[brotli,zstd]>=2.5",
-    "trafilatura>=2.0",
+    "trafilatura>=2.3",
     "lxml>=5.0",
     "pypdf>=5.0",
     "price-parser>=0.5",

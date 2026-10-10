@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from scout.errors import FetchError
 from scout.llm.base import Completion, CompletionRequest
 from scout.llm.structured import StructuredMode
 from scout.research.results import (
@@ -22,6 +24,7 @@ from scout.research.results import (
     Source,
     Verdict,
 )
+from scout.web.archive import Snapshot, Wayback
 from scout.web.fetch import Document, FetchStatus
 from scout.web.search import SearchHit
 
@@ -47,7 +50,7 @@ class ScriptedBackend:
             self._by_purpose[request.purpose] if self._by_purpose is not None else self._in_order
         )
         reply = queue.pop(0)
-        if isinstance(reply, Exception):
+        if isinstance(reply, BaseException):
             raise reply
         if isinstance(reply, Completion):
             return reply
@@ -86,17 +89,21 @@ class FakeSearch:
 
 class FakeFetcher:
     """Serves prepared Documents (text pages get a content hash, as real ones do); URLs it does
-    not know come back BLOCKED. Like the real Fetcher, it hands what it read to a *cache*."""
+    not know come back BLOCKED. Like the real Fetcher, it hands what it read to a *cache*, but
+    not what it read with links."""
 
     def __init__(self, pages: dict[str, str | Document], *, cache: Any = None) -> None:
         self.pages = pages  # edit between runs to change the web
         self._cache = cache
         self.fetched: list[str] = []
+        self.linked: list[str] = []  # read with links
 
-    def fetch_many(self, urls, *, workers=4, deadline=45.0):
+    def fetch_many(self, urls, *, workers=4, deadline=45.0, links=False):
         self.fetched.extend(urls)
+        if links:
+            self.linked.extend(urls)
         documents = [self._document(url) for url in urls]
-        if self._cache is not None:
+        if self._cache is not None and not links:
             for doc in documents:
                 self._cache.put_page(doc)
         return documents
@@ -120,24 +127,61 @@ class FakeFetcher:
         )
 
 
+Held = tuple[datetime, str | Document]
+
+
+class FakeArchive:
+    """An archive holding a copy, or a list of copies, per page ({url: (taken, text or
+    Document)}), read through a FakeFetcher (its `fetched` lists the copies read). It records
+    each lookup as (url, before); *down* makes every lookup fail with that reason."""
+
+    def __init__(self, copies: dict[str, Held | list[Held]], *, down: str | None = None) -> None:
+        held = {url: held if isinstance(held, list) else [held] for url, held in copies.items()}
+        self.snapshots = {
+            url: sorted((Snapshot(url, taken) for taken, _ in pages), key=lambda s: s.taken)[::-1]
+            for url, pages in held.items()
+        }
+        self.web = FakeFetcher(
+            {Snapshot(url, taken).raw: page for url, pages in held.items() for taken, page in pages}
+        )
+        self.down = down
+        self.asked: list[tuple[str, datetime | None]] = []
+
+    def recent(self, url: str, *, before: datetime | None = None, count: int = 1) -> list[Snapshot]:
+        self.asked.append((url, before))
+        if self.down is not None:
+            raise FetchError(self.down)
+        found = self.snapshots.get(url, [])
+        return [s for s in found if before is None or s.taken <= before][:count]
+
+    def read(self, snapshot: Snapshot) -> Document:
+        return Wayback(self.web).read(snapshot)  # whose rules say what the archive did not serve
+
+
 class FakeResearcher:
     """Stands in for App.researcher(): returns a prepared result, or raises a prepared error."""
 
     structured_mode = StructuredMode.PROMPT
 
-    def __init__(self, outcome: RunResult | Exception) -> None:
+    def __init__(self, outcome: RunResult | BaseException) -> None:
         self.outcome = outcome
         self.checked: list[str] = []
         self.check_options: dict[str, Any] = {}
+        self.asked = 0  # model requests: none for a result carried over
 
     def run(self, goal: str, **options: Any) -> RunResult:
-        if isinstance(self.outcome, Exception):
+        if isinstance(self.outcome, BaseException):
             raise self.outcome
+        self.asked += not self.outcome.carried_over
         return self.outcome
 
-    def check(self, subject: str, **options: Any) -> RunResult:
+    def check(
+        self, subject: str, *, progress: Callable[[str], None] | None = None, **options: Any
+    ) -> RunResult:
         self.checked.append(subject)
         self.check_options = options
+        if progress is not None:
+            progress("claim 1 of 1")  # as a real check tells its steps
         return self.run(subject)
 
 
@@ -211,6 +255,7 @@ SAMPLE_RESULT = RunResult(
             status="blocked",
             query="rtx 5090 price",
             snippet_only=True,
+            text="RTX 5090 prices from $800",
         ),
     ),
     answer="About $1,999.",
@@ -333,4 +378,93 @@ CHECK_RESULT = RunResult(
         ),
     ),
     checked_text=CHECKED_TEXT,
+)
+
+# A cite-check of an AI answer: its [1] and [2] say otherwise, its [3] says nothing of the claim,
+# and its [4] could not be read.
+CITED_TEXT = (
+    "Python 3.13 was released on October 7, 2023 [1]. It removed the global interpreter lock by "
+    "default [2]. Its JIT makes it 40% faster than 3.12 [3]. See the docs [2] for more. It runs "
+    "on iOS as a tier 3 platform [4]."
+)
+GONE = "https://example.org/gone"
+UNREAD = "could not read [4] example.org (not found: HTTP 404)"
+CITE_RESULT = replace(
+    CHECK_RESULT,
+    goal="cite-check: Python 3.13 was released on October 7, 2023 [1]. It removed the global"
+    "\N{HORIZONTAL ELLIPSIS}",
+    plan=Plan(queries=(), kind=CHECK_KIND, recency=None, planner="model"),
+    sources=(
+        *(replace(source, query=f"cited as [{source.index}]") for source in CHECK_RESULT.sources),
+        Source(
+            index=4,
+            url=GONE,
+            title=GONE,
+            site="example.org",
+            status="not_found",
+            query="cited as [4]",
+            snippet_only=True,
+            error="HTTP 404",
+        ),
+    ),
+    answer="Of 4 cited claims: 2 contradicted, 1 not found, 1 unreadable.",
+    findings=(
+        CHECK_RESULT.findings[0],
+        Finding(
+            claim="The GIL remains enabled by default.",
+            quote="The free-threaded mode is experimental and the GIL remains enabled by default.",
+            source=2,
+            verdict=Verdict.VERIFIED,
+        ),
+    ),
+    confidence=Confidence(
+        "medium",
+        "2 of 4 cited claims settled by the pages they cite; 1 cited page could not be read",
+    ),
+    warnings=(f"claim 4: {UNREAD}",),
+    claims=(
+        ClaimCheck(
+            claim=RELEASED_2023,
+            excerpt="Python 3.13 was released on October 7, 2023 [1].",
+            query="python 3.13 release date",
+            refutes=(1,),
+            note="The page gives October 7, 2024.",
+            pages=(1,),
+        ),
+        ClaimCheck(
+            claim="Python 3.13 removed the global interpreter lock by default.",
+            excerpt="It removed the global interpreter lock by default [2].",
+            query="python 3.13 gil",
+            refutes=(2,),
+            pages=(2,),
+        ),
+        ClaimCheck(
+            claim="Python 3.13's JIT makes it 40% faster than Python 3.12.",
+            excerpt="Its JIT makes it 40% faster than 3.12 [3].",
+            query="python 3.13 jit speed",
+            pages=(3,),
+        ),
+        ClaimCheck(
+            claim="Python 3.13 runs on iOS as a tier 3 platform.",
+            excerpt="It runs on iOS as a tier 3 platform [4].",
+            query="python 3.13 ios",
+            problems=(UNREAD,),
+            pages=(4,),
+        ),
+    ),
+    checked_text=CITED_TEXT,
+    cited=True,
+)
+# An audit of the same answer: every cited sentence was read, and "See the docs [2] for more."
+# makes no claim.
+AUDIT_RESULT = replace(
+    CITE_RESULT,
+    goal=CITE_RESULT.goal.replace("cite-check", "citation audit"),
+    answer=f"{CITE_RESULT.answer} Audit: 4 of 5 cited sentences checked, as 4 claims; in 1 no "
+    "claim was checked (listed under Not checked).",
+    confidence=Confidence(
+        "medium", f"{CITE_RESULT.confidence.reason}; 1 cited sentence not checked"
+    ),
+    audit=True,
+    skipped=("See the docs [2] for more.",),
 )

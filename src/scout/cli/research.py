@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -14,8 +15,10 @@ from rich.markup import escape
 from rich.table import Table
 
 from scout.app import App
-from scout.cli._common import KINDS, RECENCY, err, out, settings, when
+from scout.cli._common import KINDS, RECENCY, err, linked, out, settings, when
+from scout.errors import AnswerPending, LLMError, ScoutError
 from scout.evaluate import EvalCase, case_files, load_scores, regressions, save_scores
+from scout.files import write_atomic
 from scout.llm.openai_compat import OpenAICompatBackend
 from scout.report import (
     note_name,
@@ -25,12 +28,34 @@ from scout.report import (
     render_note,
     save,
 )
-from scout.research.factcheck import CLAIM_LIMIT, MAX_CLAIMS
+from scout.research.citations import relinked
+from scout.research.deadlinks import (
+    MOVED,
+    NOT_LOOKED_UP,
+    REPLACE,
+    DeadLink,
+    dead_links,
+    key,
+    replacements,
+)
+from scout.research.factcheck import (
+    AUDIT_LIMIT,
+    CLAIM_LIMIT,
+    MAX_CLAIMS,
+    PAGES_PER_CLAIM,
+    archivable,
+    web_address,
+)
 from scout.research.pipeline import MAX_ROUNDS, Researcher
 from scout.research.results import CHECK_KIND, RunResult
 from scout.settings import Settings
 from scout.textutil import clean, looks_like_junk, shorten
 from scout.web.domains import hostname
+
+_RESUMABLE = (
+    "The audit keeps what it read and judged for a day: run the same command to continue "
+    "where it stopped."
+)
 
 
 @click.command()
@@ -90,17 +115,55 @@ def run(
 @click.option(
     "--claims",
     type=click.IntRange(1, CLAIM_LIMIT),
-    default=MAX_CLAIMS,
-    show_default=True,
-    help="Claims to check at most.",
+    help=f"Claims to check at most (default {MAX_CLAIMS}).",
 )
 @click.option(
     "-n",
     "--pages",
     type=click.IntRange(1, 10),
-    default=3,
-    show_default=True,
-    help="Pages to read per claim.",
+    help=f"Pages to read per claim (default {PAGES_PER_CLAIM}).",
+)
+@click.option(
+    "--cited",
+    is_flag=True,
+    help="Check instead that the pages the text (or the page at the address) cites say what it "
+    "says (nothing is searched).",
+)
+@click.option(
+    "--all",
+    "audit",
+    is_flag=True,
+    help=f"With --cited: check every cited sentence, however long the text (up to {AUDIT_LIMIT} "
+    "claims), part by part; one model request per claim, resumable.",
+)
+@click.option(
+    "--allow-private",
+    is_flag=True,
+    help="With --cited, also read a page, or cited addresses, on private networks (intranet docs).",
+)
+@click.option(
+    "--archive",
+    is_flag=True,
+    help="With --cited: judge a claim citing dead pages on their newest archived copies "
+    "(web.archive.org), shown beside its label, and list the copies to cite instead; one model "
+    "request per claim.",
+)
+@click.option(
+    "--fix",
+    "fixed_path",
+    metavar="OUT",
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="With --cited: also look up dead cited pages on the Wayback Machine (as --archive), then "
+    "write the text to OUT with each dead citation whose archived copy backs what it is cited "
+    "for replaced by that copy, or by the live page it moved to when that page still holds the "
+    "quote, opened at the quote.",
+)
+@click.option(
+    "--find-moved",
+    is_flag=True,
+    help="With --cited: also search (SCOUT_SEARCH) the site of a dead cited page whose archived "
+    "copy backs a claim, and the site it redirects to, for one sentence of the copy, to find "
+    "where it moved; implies --archive.",
 )
 @click.option("--llm", "llm_spec", help="Override SCOUT_LLM, e.g. exchange:./answers")
 @click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
@@ -108,8 +171,14 @@ def run(
 def factcheck(
     subject: str | None,
     text_file: BinaryIO | None,
-    claims: int,
-    pages: int,
+    claims: int | None,
+    pages: int | None,
+    cited: bool,
+    audit: bool,
+    allow_private: bool,
+    archive: bool,
+    fixed_path: Path | None,
+    find_moved: bool,
     llm_spec: str | None,
     as_json: bool,
     no_save: bool,
@@ -118,20 +187,212 @@ def factcheck(
 
     Each claim is ruled supported, refuted, disputed or unclear from quotes Scout found word for
     word on the pages it read. The saved report includes an annotated page (.html) of the text.
+
+    With --cited, each claim is checked only against the pages its sentence cites (its links,
+    footnotes, or numbered sources; a web page's links and footnotes): does the text's own
+    source say it? A text may cite anything, so addresses on private networks are refused
+    unless --allow-private. With --all as well, every cited sentence is checked; an audit that
+    stops for any reason continues where it stopped when the same command runs again. With
+    --archive, a claim citing dead pages is judged on their archived copies too, and --fix OUT
+    writes the text with each dead citation whose copy backs it replaced by the copy, or by the
+    live page it moved to when that page still holds the quote (at the same path on the site
+    the dead address redirects to, or, with --find-moved, found by a search).
     """
     if (subject is None) == (text_file is None):
         raise click.UsageError("give the text to check, or -f FILE, but not both")
     name = getattr(text_file, "name", "<stdin>")
-    text = subject if text_file is None else _decoded(text_file.read(), name)
+    data = b"" if text_file is None else text_file.read()
+    if text_file is not None and name != "<stdin>":
+        text_file.close()  # --fix may replace it, which Windows refuses while it is open
+    text = subject if subject is not None else _decoded(data, name)
     if text_file is not None and looks_like_junk(text):
         raise click.UsageError(f"could not read {name} as text: save it as UTF-8")
     if not clean(text):
         raise click.UsageError("nothing to check")
+    if cited and pages is not None:
+        raise click.UsageError(
+            "--pages does not apply to --cited: each claim is judged on the pages its sentence "
+            "cites"
+        )
+    if allow_private and not cited:
+        raise click.UsageError("--allow-private applies to --cited only")
+    if fixed_path is not None and not cited:
+        raise click.UsageError("--fix applies to --cited only")
+    if fixed_path is not None and web_address(clean(text)):
+        raise click.UsageError(
+            "--fix rewrites a text you give (the text itself or -f FILE); for a web page, "
+            "--archive lists each dead citation and the archived copy to cite instead"
+        )
+    if fixed_path is not None:
+        # Found out after the check, it would cost the check: an audit may take hours.
+        _writable(fixed_path)
+    if find_moved and not cited:
+        raise click.UsageError("--find-moved applies to --cited only")
+    archive = archive or fixed_path is not None or find_moved
+    if archive and not cited:
+        raise click.UsageError("--archive applies to --cited only")
+    if archive and allow_private:
+        raise click.UsageError(
+            "--archive sends the addresses of unreadable cited pages to web.archive.org; it does "
+            "not combine with --allow-private, whose pages may be intranet addresses"
+        )
+    if audit and not cited:
+        raise click.UsageError(
+            "--all applies to --cited only: a plain check searches the web for every claim"
+        )
+    if audit and claims is not None:
+        raise click.UsageError(
+            f"--claims does not apply to --all, which checks every cited claim (at most "
+            f"{AUDIT_LIMIT})"
+        )
     with App(settings(), llm=llm_spec) as app:
-        researcher = app.researcher(max_results=pages)
-        with err.status("Fact-checking\N{HORIZONTAL ELLIPSIS}", spinner="dots"):
-            result = researcher.check(text, max_claims=claims)
-        _finish(app, researcher, result, as_json=as_json, no_save=no_save)
+        researcher = app.researcher(
+            max_results=pages or PAGES_PER_CLAIM,
+            public_only=cited and not allow_private,
+            archive=archive,
+            find_moved=find_moved,
+        )
+        doing = "Auditing citations" if audit else "Cite-checking" if cited else "Fact-checking"
+        doing += "\N{HORIZONTAL ELLIPSIS}"
+        with err.status(doing, spinner="dots") as status:
+            try:
+                result = researcher.check(
+                    text,
+                    max_claims=claims or MAX_CLAIMS,
+                    cited=cited,
+                    audit=audit,
+                    progress=lambda step: status.update(f"{doing} {step}"),
+                )
+            except AnswerPending:
+                raise
+            except LLMError as exc:
+                if audit:
+                    exc.add_note(_RESUMABLE)
+                raise
+            except KeyboardInterrupt:
+                if audit:
+                    err.print(_RESUMABLE)
+                raise
+        links = dead_links(result) if archive else []
+        fix = relinked(text, replacements(links))
+        replaced = [link.n for link in links if link.link and key(link) in fix.replaced]
+        extra = (
+            None
+            if fixed_path is None
+            else {"fixed": {"path": str(fixed_path), "replaced": replaced}}
+        )
+        run_id = _finish(app, researcher, result, as_json=as_json, no_save=no_save, extra=extra)
+        if fixed_path is not None:
+            _write_fixed(fixed_path, fix.text, data, text_file, links, run_id)
+            done = _fixed(links, replaced)
+            err.print(f"[dim]Fixed text: {escape(str(fixed_path))} ({done})[/]")
+        if not find_moved and (copied := sum(link.state == REPLACE for link in links)):
+            err.print(f"[dim]{_moved_hint(copied, fixing=fixed_path is not None)}[/]")
+        offered = cited and not (archive or allow_private) and app.archive is not None
+        if offered and (dead := _gone(result)):
+            pages, their = ("cited pages are", "their") if dead > 1 else ("cited page is", "its")
+            hint = (
+                f"{dead} {pages} gone: --archive judges {their} claims on archived copies "
+                "(web.archive.org)"
+            )
+            if not web_address(clean(text)):
+                hint += "; --fix FILE also writes the text with the fixable links replaced"
+            err.print(f"[dim]{hint}[/]")
+
+
+def _gone(result: RunResult) -> int:
+    """How many of the pages the checked claims cite are gone, and may be looked up."""
+    cited = {n for claim in result.claims for n in claim.pages}
+    return sum(1 for page in result.sources if page.index in cited and archivable(page))
+
+
+def _writable(path: Path) -> None:
+    """Refuse an OUT that cannot be written, before the check rather than after it."""
+    if str(path) == "-":
+        raise click.UsageError("--fix needs a file to write (it may be the -f file itself)")
+    existed = path.exists()
+    try:
+        with path.open("a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise click.UsageError(f"--fix: cannot write {path}: {exc.strerror or exc}") from exc
+    if not existed:
+        path.unlink(missing_ok=True)
+
+
+def _write_fixed(
+    path: Path,
+    fixed: str,
+    data: bytes,
+    text_file: BinaryIO | None,
+    links: Sequence[DeadLink],
+    run_id: int | None,
+) -> None:
+    """Write the fixed text to *path*, whole or not at all, as it was read: the same line
+    endings, and a BOM if it had one. When *path* is the file checked and it changed while the
+    check ran, the fixes go into what it holds now: they are made by address."""
+    name = getattr(text_file, "name", None)
+    if name is not None and Path(name).resolve() == path.resolve():
+        now = path.read_bytes()
+        if now != data:
+            data = now
+            fixed = relinked(_decoded(now, str(path)), replacements(links)).text
+    bom = data.startswith((codecs.BOM_UTF8, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    try:
+        write_atomic(path, f"\N{ZERO WIDTH NO-BREAK SPACE}{fixed}" if bom else fixed)
+    except OSError as exc:
+        kept = f"; the check is kept as run {run_id}" if run_id is not None else ""
+        raise ScoutError(f"could not write {path}: {exc.strerror or exc}{kept}") from exc
+
+
+def _fixed(links: Sequence[DeadLink], replaced: Sequence[int]) -> str:
+    """What --fix did to the text: *replaced* are the dead citations it replaced."""
+    if not links:
+        return "no checked claim cites a dead page: unchanged"
+    unasked = sum(link.state == NOT_LOOKED_UP for link in links)
+    if not replaced:
+        if unasked == len(links):
+            pages = (
+                "the dead cited page was"
+                if unasked == 1
+                else f"the {unasked} dead cited pages were"
+            )
+            return f"unchanged: {pages} not looked up; run the same command later"
+        pages = (
+            "the dead cited page has no archived copy"
+            if len(links) == 1
+            else f"none of the {len(links)} dead cited pages has an archived copy"
+        )
+        return f"unchanged: {pages} that backs its claims; see Dead links"
+    count = f"{len(replaced)} dead citation{'s' if len(replaced) > 1 else ''} replaced"
+    moved = sum(1 for link in links if link.n in replaced and link.state == MOVED)
+    copied = len(replaced) - moved
+    new = "its new address" if moved == 1 else "their new addresses"
+    copies = "its archived copy" if copied == 1 else "their archived copies"
+    if moved and copied:
+        done = f"{count}: {moved} by {new}, {copied} by {copies}"
+    else:
+        done = f"{count} by {new if moved else copies}"
+    left = len(links) - len(replaced)
+    return f"{done}; {left} left: see Dead links" if left else done
+
+
+def _moved_hint(copied: int, *, fixing: bool) -> str:
+    """What --find-moved would do for the *copied* dead citations a check cites archived copies
+    for (*fixing*: the fixed text now does)."""
+    if copied == 1:
+        cites = "now cites" if fixing else "can cite"
+        return (
+            f"1 dead citation {cites} an archived copy: --find-moved also searches its site "
+            "(SCOUT_SEARCH) for one sentence of the copy, never your text, to cite the page "
+            "where it moved"
+        )
+    cites = "now cite" if fixing else "can cite"
+    return (
+        f"{copied} dead citations {cites} archived copies: --find-moved also searches their "
+        "sites (SCOUT_SEARCH) for one sentence of each copy, never your text, to cite the pages "
+        "where they moved"
+    )
 
 
 def _decoded(data: bytes, name: str) -> str:
@@ -146,23 +407,31 @@ def _decoded(data: bytes, name: str) -> str:
 
 
 def _finish(
-    app: App, researcher: Researcher, result: RunResult, *, as_json: bool, no_save: bool
-) -> None:
-    """Keep a finished run (unless *no_save*), then print it."""
+    app: App,
+    researcher: Researcher,
+    result: RunResult,
+    *,
+    as_json: bool,
+    no_save: bool,
+    extra: dict[str, Any] | None = None,
+) -> int | None:
+    """Keep a finished run (unless *no_save*), then print it, with *extra* in its JSON. Returns
+    the run's id, or None when it is not kept."""
     app.learn_from(researcher)
     run_id = None if no_save else app.store.add_run(result)
     paths = None if no_save else save(result, app.settings.reports_dir, run_id=run_id)
     if as_json:
-        data = json.loads(render_json(result, run_id=run_id))
+        data = json.loads(render_json(result, run_id=run_id)) | (extra or {})
         if paths:
             data["saved"] = [str(path) for path in paths]
         out.print_json(data=data)
-        return
+        return run_id
     out.print(Markdown(render_markdown(result, run_id=run_id)))
     if paths:
         err.print(f"[dim]Saved {escape(str(paths[0]))}[/]")
         for page in (path for path in paths if path.suffix == ".html"):
             err.print(f"[dim]Annotated page: {escape(str(page))}[/]")
+    return run_id
 
 
 @click.command()
@@ -186,7 +455,7 @@ def ask(question: str, limit: int, as_json: bool) -> None:
         seen = f"found {first} (run {memory.run_id})" + (
             f", last seen {last}" if last != first else ""
         )
-        out.print(f"   {escape(hostname(memory.url))}: {seen}")
+        out.print(f"   {linked(escape(hostname(memory.url)), memory.link)}: {seen}")
 
 
 @click.command()
@@ -500,6 +769,7 @@ def _describe(config: Settings) -> list[tuple[str, str]]:
         ("API key", key),
         ("search", config.search),
         ("JavaScript pages", config.render or "not rendered"),
+        ("archived copies", config.archive),
         ("data folder", str(config.data_dir)),
         ("reports folder", str(config.reports_dir)),
     ]

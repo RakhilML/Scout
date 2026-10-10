@@ -5,6 +5,12 @@ import pytest
 from tests.helpers import Clock
 
 
+@pytest.fixture(autouse=True)
+def no_archive(monkeypatch):
+    """No test asks the real Wayback Machine: one that wants an archive sets app.archive."""
+    monkeypatch.setattr("scout.app.make_archive", lambda spec, fetcher: None)
+
+
 @pytest.fixture
 def clock() -> Clock:
     return Clock()
