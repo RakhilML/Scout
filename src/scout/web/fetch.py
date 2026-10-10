@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import logging
 import queue
 import re
@@ -26,7 +27,7 @@ from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 
 from scout.clock import utcnow
-from scout.errors import ExtractionError, RenderError
+from scout.errors import ExtractionError, FetchError, RenderError
 from scout.settings import DEFAULT_USER_AGENT
 from scout.textutil import looks_like_junk
 from scout.web.domains import DEFAULT_SKIP_DOMAINS, hostname, matches_any, private_address
@@ -45,6 +46,7 @@ log = logging.getLogger(__name__)
 # Below this much main text a page is navigation or a stub (unless it publishes offers).
 _MIN_TEXT_CHARS = 200
 _ACCEPT = "text/html,application/xhtml+xml,application/pdf;q=0.9,text/plain;q=0.8,*/*;q=0.5"
+_MAX_JSON_BYTES = 1_000_000
 
 
 class FetchStatus(StrEnum):
@@ -250,7 +252,10 @@ class Fetcher:
                 session.close()
             self._sessions.clear()
 
-    def fetch(self, url: str) -> Document:
+    def fetch(self, url: str, *, links: bool = False) -> Document:
+        """*url* as read now, or from the cache while it is fresh. With *links* its text keeps
+        the links and notes it cites (see extract_html): such a read bypasses the cache, whose
+        pages are read without them."""
         now = self._clock()
         if matches_any(url, self._config.skip_domains):
             return Document(
@@ -264,7 +269,8 @@ class Fetcher:
                 return _refused(url, "its address is ambiguous", now)
             if (address := private_address(url)) is not None:
                 return _private(url, _PrivateHop(url, address), now)
-        cached = self._cache.get_page(url) if self._cache is not None else None
+        cache = None if links else self._cache
+        cached = cache.get_page(url) if cache is not None else None
         if self._config.public_only and cached is not None and _landed_privately(cached):
             cached = None  # read earlier by a fetcher that may read private pages
         if cached is not None and cached.ok and cached.extractor != EXTRACTOR_VERSION:
@@ -272,20 +278,27 @@ class Fetcher:
         if cached is not None and self._is_fresh(cached, now):
             return replace(cached, from_cache=True)
 
-        doc = self._download(url, cached, now)
-        if self._cache is not None and doc.status is not FetchStatus.REFUSED:
-            self._cache.put_page(doc)
+        doc = self._download(url, cached, now, links=links)
+        if cache is not None and doc.status is not FetchStatus.REFUSED:
+            cache.put_page(doc)
         return doc
 
     def fetch_many(
-        self, urls: Sequence[str], *, workers: int = 4, deadline: float = 45.0
+        self,
+        urls: Sequence[str],
+        *,
+        workers: int = 4,
+        deadline: float = 45.0,
+        links: bool = False,
     ) -> list[Document]:
         """Fetch *urls* in parallel; whatever is unfinished at *deadline* seconds is abandoned."""
         if not urls:
             return []
         results: dict[int, Document] = {}
         pool = ThreadPoolExecutor(max_workers=min(workers, len(urls)), thread_name_prefix="fetch")
-        futures = {pool.submit(self.fetch, url): index for index, url in enumerate(urls)}
+        futures = {
+            pool.submit(self.fetch, url, links=links): index for index, url in enumerate(urls)
+        }
         try:
             for future in as_completed(futures, timeout=deadline):
                 index = futures[future]
@@ -319,6 +332,39 @@ class Fetcher:
             )
             for index, url in enumerate(urls)
         ]
+
+    def json(self, url: str, *, timeout: float | None = None) -> Any:
+        """What an API at *url* answers, as JSON: read now, never from the cache, under this
+        fetcher's rules, and never retried. FetchError when it cannot be read."""
+        if self._config.public_only:
+            if _AMBIGUOUS.search(url):
+                raise FetchError("its address is ambiguous")
+            if (address := private_address(url)) is not None:
+                raise FetchError(_private_why(url, _PrivateHop(url, address)))
+        seconds = timeout or self._config.timeout
+        headers = {"Accept": "application/json"}
+        try:
+            with (
+                self._session() as session,
+                session.get(
+                    url, headers=headers, timeout=seconds, stream=True, hooks=self._hooks
+                ) as resp,
+            ):
+                if resp.status_code != 200:
+                    raise FetchError(f"HTTP {resp.status_code}")
+                body = _read_body(resp, _MAX_JSON_BYTES, seconds)
+        except _PrivateHop as hop:
+            raise FetchError(_private_why(url, hop)) from None
+        except _BodyTooLarge:
+            raise FetchError(f"larger than {_MAX_JSON_BYTES:,} bytes") from None
+        except (requests.Timeout, _BodyTooSlow):
+            raise FetchError(f"no response within {seconds:g}s") from None
+        except requests.RequestException as exc:
+            raise FetchError(_describe(exc)) from exc
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise FetchError("not JSON") from None
 
     def _is_fresh(self, doc: Document, now: datetime) -> bool:
         limit = (
@@ -354,7 +400,9 @@ class Fetcher:
         finally:
             self._idle.put(session)
 
-    def _download(self, url: str, cached: Document | None, now: datetime) -> Document:
+    def _download(
+        self, url: str, cached: Document | None, now: datetime, *, links: bool
+    ) -> Document:
         with self._session() as session:
             headers = _revalidation_headers(cached)
             failure = Document(url=url, status=FetchStatus.NETWORK_ERROR, fetched_at=now)
@@ -373,7 +421,7 @@ class Fetcher:
                             return replace(cached, fetched_at=now, from_cache=True)
                         status = _status_for_http(resp.status_code)
                         if status is None:
-                            return self._read(url, resp, now)
+                            return self._read(url, resp, now, links=links)
                         failure = Document(
                             url=url,
                             status=status,
@@ -408,7 +456,7 @@ class Fetcher:
                     )
             return failure
 
-    def _read(self, url: str, resp: requests.Response, now: datetime) -> Document:
+    def _read(self, url: str, resp: requests.Response, now: datetime, *, links: bool) -> Document:
         def failed(status: FetchStatus, error: str) -> Document:
             return Document(url=url, status=status, fetched_at=now, final_url=resp.url, error=error)
 
@@ -426,7 +474,7 @@ class Fetcher:
                 FetchStatus.UNSUPPORTED, f"cannot read content type {media_type or 'unknown'!r}"
             )
         try:
-            extracted = _extract(kind, body, resp, today=now.date())
+            extracted = _extract(kind, body, resp, today=now.date(), links=links)
         except ExtractionError as exc:
             return failed(FetchStatus.UNSUPPORTED, str(exc))
         except Exception as exc:  # parsers meeting hostile bytes raise anything
@@ -438,18 +486,20 @@ class Fetcher:
         if _readable(extracted):
             return _document(url, now, kind, extracted, resp)
         if kind == "html" and self._renderer is not None:
-            return _rendered(self._renderer, url, now, resp)
+            return _rendered(self._renderer, url, now, resp, links=links)
         return failed(FetchStatus.EMPTY, "no readable main text")
 
 
-def _rendered(renderer: Renderer, url: str, now: datetime, resp: requests.Response) -> Document:
+def _rendered(
+    renderer: Renderer, url: str, now: datetime, resp: requests.Response, *, links: bool
+) -> Document:
     """The page as a browser shows it, for pages that build their text with scripts."""
     try:
         html = renderer.render(resp.url or url)
     except RenderError as exc:  # our browser failed, not the site: UNSUPPORTED, not EMPTY
         error = f"no readable main text, and rendering failed: {exc}"
         return Document(url=url, status=FetchStatus.UNSUPPORTED, fetched_at=now, error=error)
-    extracted = extract_html(html.encode("utf-8"), resp.url or url, today=now.date())
+    extracted = extract_html(html.encode("utf-8"), resp.url or url, today=now.date(), links=links)
     if not _readable(extracted):
         error = "no readable main text, even rendered"
         return Document(url=url, status=FetchStatus.EMPTY, fetched_at=now, error=error)
@@ -508,13 +558,15 @@ def _landed_privately(doc: Document) -> bool:
 
 
 def _private(url: str, hop: _PrivateHop, now: datetime) -> Document:
+    return _refused(url, _private_why(url, hop), now)
+
+
+def _private_why(url: str, hop: _PrivateHop) -> str:
     if hop.url is None:
-        why = f"it leads to a private network ({hop.address})"
-    elif hop.url == url:
-        why = f"it is on a private network ({hop.address})"
-    else:
-        why = f"it redirects to {hop.url}, which is on a private network ({hop.address})"
-    return _refused(url, why, now)
+        return f"it leads to a private network ({hop.address})"
+    if hop.url == url:
+        return f"it is on a private network ({hop.address})"
+    return f"it redirects to {hop.url}, which is on a private network ({hop.address})"
 
 
 def _refused(url: str, why: str, now: datetime) -> Document:
@@ -563,16 +615,28 @@ def _content_kind(media_type: str, body: bytes) -> str | None:
     return None
 
 
-def _extract(kind: str, body: bytes, resp: requests.Response, *, today: date) -> Extracted:
+def _extract(
+    kind: str, body: bytes, resp: requests.Response, *, today: date, links: bool
+) -> Extracted:
     if kind == "pdf":
         return extract_pdf(body, today=today)
     if kind == "html":
-        return extract_html(body, resp.url, today=today)
+        return extract_html(body, resp.url, today=today, links=links)
     encoding = resp.encoding if "charset" in resp.headers.get("Content-Type", "") else None
     try:
-        return extract_plain_text(body, encoding or resp.apparent_encoding or "utf-8")
+        return extract_plain_text(body, encoding or _sniffed(body))
     except LookupError:  # a charset Python does not know, e.g. "utf8mb4"
         return extract_plain_text(body, "utf-8")
+
+
+def _sniffed(body: bytes) -> str:
+    """The encoding of text sent without a charset: UTF-8 if it decodes, else Windows-1252.
+    (The response's own guess reads a body this streamed download has already taken.)"""
+    try:
+        body.decode("utf-8")
+    except UnicodeDecodeError:
+        return "cp1252"
+    return "utf-8"
 
 
 def _content_hash(extracted: Extracted) -> str:

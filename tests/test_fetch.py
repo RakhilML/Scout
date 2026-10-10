@@ -10,7 +10,7 @@ import requests
 import responses
 from urllib3.response import HTTPResponse
 
-from scout.errors import ConfigError, RenderError
+from scout.errors import ConfigError, FetchError, RenderError
 from scout.store import Store
 from scout.web.extract import EXTRACTOR_VERSION
 from scout.web.fetch import Document, FetchConfig, Fetcher, FetchStatus
@@ -86,6 +86,15 @@ def test_binary_body_is_rejected_as_junk(clock):
         content_type="text/plain; charset=utf-8",
     )
     assert make_fetcher(clock).fetch(URL).status is FetchStatus.JUNK
+
+
+@responses.activate
+@pytest.mark.parametrize("encoding", ["utf-8", "cp1252"])
+def test_plain_text_without_a_charset_is_read(clock, encoding):
+    text = "Tim Peters wrote listsort.txt \N{EM DASH} timsort's own notes. " * 8
+    responses.add(responses.GET, URL, body=text.encode(encoding), content_type="text/plain")
+    doc = make_fetcher(clock).fetch(URL)
+    assert (doc.status, doc.text) == (FetchStatus.OK, text.strip())
 
 
 @responses.activate
@@ -211,6 +220,32 @@ def test_pages_read_by_an_older_extractor_are_read_again(clock):
     assert "32 GB" in doc.text
 
 
+LINKED = ARTICLE.replace(
+    b"</p>", b' See <a href="https://vendor.example/specs">the spec sheet</a>.</p>'
+)
+
+
+@responses.activate
+def test_a_page_read_with_its_links_is_read_fresh_and_never_cached(clock):
+    cache = MemoryCache()
+    responses.add(
+        responses.GET, URL, body=LINKED, content_type="text/html", headers={"ETag": '"v1"'}
+    )
+    fetcher = make_fetcher(clock, cache)
+    plain = fetcher.fetch(URL)
+    clock.advance(60)
+    linked = fetcher.fetch(URL, links=True)
+
+    assert len(responses.calls) == 2
+    assert "If-None-Match" not in responses.calls[1].request.headers
+    assert not linked.from_cache
+    assert "[the spec sheet](https://vendor.example/specs)" in linked.text
+    assert "](" not in plain.text
+    assert cache.get_page(URL).text == plain.text
+    assert fetcher.fetch_many([URL], links=True)[0].text == linked.text
+    assert len(responses.calls) == 3
+
+
 class Browser:
     """A renderer that returns prepared HTML (or fails), and remembers what it was asked."""
 
@@ -239,6 +274,8 @@ def test_pages_built_by_scripts_are_rendered_when_a_browser_is_set(clock):
     doc = Fetcher(FetchConfig(), renderer=browser, clock=clock).fetch(URL)
     assert (doc.status, browser.urls) == (FetchStatus.OK, [URL])
     assert "32 GB of GDDR7 memory" in doc.text
+    linked = Fetcher(FetchConfig(), renderer=Browser(LINKED.decode()), clock=clock)
+    assert "](https://vendor.example/specs)" in linked.fetch(URL, links=True).text
 
     broken = Browser(error="Timeout 24000ms exceeded")
     failed = Fetcher(FetchConfig(), renderer=broken, clock=clock).fetch(URL)
@@ -282,7 +319,7 @@ def test_sessions_are_reused_across_batches(clock):
 def test_fetch_many_honours_its_deadline(clock, monkeypatch):
     fetcher = make_fetcher(clock)
 
-    def fake_fetch(url: str) -> Document:
+    def fake_fetch(url: str, *, links: bool = False) -> Document:
         if "slow" in url:
             time.sleep(1.5)
         return Document(url=url, status=FetchStatus.OK, fetched_at=clock.now, text="x")
@@ -375,3 +412,26 @@ def test_a_public_only_fetcher_skips_a_cached_page_that_landed_privately():
         )
         doc = Fetcher(FetchConfig(public_only=True), cache=store, clock=Clock()).fetch(public)
     assert (doc.from_cache, "secret" in doc.text) == (False, False)
+
+
+@responses.activate
+def test_an_apis_json_is_read_fresh_under_the_fetchers_rules(clock):
+    api = "http://93.184.216.34/cdx?url=x"
+    responses.add(responses.GET, api, json=[["timestamp"], ["20230120234050"]])
+    responses.add(responses.GET, "http://93.184.216.34/limited", status=429)
+    with Store(":memory:") as store:
+        fetcher = Fetcher(FetchConfig(public_only=True), cache=store, clock=clock)
+        assert fetcher.json(api) == [["timestamp"], ["20230120234050"]]
+        assert fetcher.json(api) == [["timestamp"], ["20230120234050"]]
+        assert store.get_page(api) is None
+        with pytest.raises(FetchError, match=r"^HTTP 429$"):
+            fetcher.json("http://93.184.216.34/limited")
+        with pytest.raises(FetchError, match=r"^it is on a private network \(127\.0\.0\.1\)$"):
+            fetcher.json("http://127.0.0.1:1234/v1/models")
+        with pytest.raises(FetchError, match=r"^its address is ambiguous$"):
+            fetcher.json("http://127.0.0.1:1234\\@unresolvable.invalid/x")
+    assert [call.request.url for call in responses.calls] == [
+        api,
+        api,
+        "http://93.184.216.34/limited",
+    ]
