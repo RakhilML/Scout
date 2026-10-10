@@ -30,6 +30,13 @@ def test_alerts_become_atom_entries():
     assert entry.findtext(f"{ATOM}summary") == ALERT.quote
 
 
+def test_an_entry_links_to_where_its_quote_is_on_the_page():
+    placed = replace(ALERT, anchor="text=Now%20%241%2C799.")
+    entry = ET.fromstring(atom(WATCH, [placed], now=NOW)).find(f"{ATOM}entry")
+    href = entry.find(f"{ATOM}link").get("href")
+    assert href == "https://shop.example/5090?a=1&b=2#:~:text=Now%20%241%2C799."
+
+
 def test_entry_ids_are_stable_and_distinct():
     ids = [
         ET.fromstring(atom(WATCH, [alert], now=NOW)).findtext(f"{ATOM}entry/{ATOM}id")

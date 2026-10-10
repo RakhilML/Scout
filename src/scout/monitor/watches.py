@@ -1,4 +1,5 @@
-"""Watches: research goals that re-run on a schedule. Kept in a YAML file you can edit by hand."""
+"""Watches: research goals, texts whose claims are fact-checked, or texts and pages whose
+citations are audited, that re-run on a schedule. Kept in a YAML file you can edit by hand."""
 
 from __future__ import annotations
 
@@ -15,12 +16,19 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from scout.errors import ConfigError
 from scout.files import FileLock, write_atomic
-from scout.monitor.rules import parse_rule
+from scout.monitor.rules import CITED_RULES, CLAIM_RULES, parse_rule
+from scout.research import citations
+from scout.research.factcheck import web_address
+from scout.textutil import clean, shorten
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _INTERVAL = re.compile(r"^(\d+)\s*(m|min|minutes?|h|hr|hours?|d|days?|w|weeks?)$", re.IGNORECASE)
 _INTERVAL_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
 _MIN_INTERVAL_MINUTES = 15  # being polite to the sites watched, and to the GPU
+# A claim watch's text is never cut to fit the model's context (the smallest window holds about
+# 1,965 characters of it), so the text a run checked tells whether the watch's text changed.
+CHECK_TEXT_LIMIT = 1500
+LABEL_CHARS = 120  # a long goal (a citation watch's text) where a watch is named or listed
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +45,8 @@ class Watch:
     notify: tuple[str, ...] = ()  # Apprise URLs such as "ntfy://my-topic"
     stop_when_alerted: bool = False
     paused: bool = False
+    check: bool = False  # the goal is a text whose claims are fact-checked on every run
+    cited: bool = False  # with check: the goal is a text or a page whose citations are audited
 
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
@@ -48,8 +58,25 @@ class Watch:
         if (self.every is None) == (self.cron is None):
             raise ConfigError(f"watch {self.name!r} needs exactly one of 'every' or 'cron'")
         trigger(self)  # validates the schedule
-        for rule in self.alerts:
-            parse_rule(rule)  # validates each rule
+        kinds = [(rule, parse_rule(rule).kind) for rule in self.alerts]  # validates each rule
+        dead = next((rule for rule, kind in kinds if kind == "dead"), None)
+        if self.cited:
+            why = _unfit_for_citations(self, kinds)
+        elif dead is not None:
+            why = f"only a citation watch alerts on {dead!r}"
+        elif self.check:
+            why = _unfit_for_claims(self, kinds)
+        else:
+            own = [rule for rule, kind in kinds if kind in CLAIM_RULES - {"changed"}]
+            why = f"only a claim watch alerts on {own[0]!r}" if own else None
+        if why is not None:
+            raise ConfigError(f"watch {self.name!r}: {why}")
+
+    @property
+    def label(self) -> str:
+        """The goal where alerts, feeds and lists name the watch: a text by its start, so that
+        a notification shows its alerts, not the text a citation watch audits."""
+        return shorten(" ".join(self.goal.split()), LABEL_CHARS)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -75,6 +102,36 @@ class Watch:
                 raise ConfigError(f"watch {name!r}: {key} must be a list of text")
             values[key] = tuple(items)
         return cls(**values)
+
+
+def _unfit_for_claims(watch: Watch, kinds: Sequence[tuple[str, str]]) -> str | None:
+    text = clean(watch.goal)
+    if web_address(text):
+        return "a claim watch checks a text, not a web address"
+    if len(text) > CHECK_TEXT_LIMIT:
+        return f"a claim watch checks at most {CHECK_TEXT_LIMIT} characters of text"
+    if watch.kind is not None or watch.recency is not None:
+        return "a claim watch has no kind or recency"
+    other = next((rule for rule, kind in kinds if kind not in CLAIM_RULES), None)
+    if other is not None:
+        return f"a claim watch alerts on changed, supported or refuted, not {other!r}"
+    return None
+
+
+def _unfit_for_citations(watch: Watch, kinds: Sequence[tuple[str, str]]) -> str | None:
+    """Why *watch* cannot audit citations. Its text is never cut (an audit reads it a part at a
+    time), so it may be long; it reads only the pages its text cites, so it searches nothing."""
+    if not watch.check:
+        return "a citation watch needs check: true"
+    if any(v is not None for v in (watch.kind, watch.recency, watch.region, watch.max_results)):
+        return "a citation watch reads only the pages its text cites"
+    other = next((rule for rule, kind in kinds if kind not in CITED_RULES), None)
+    if other is not None:
+        return f"a citation watch alerts on changed, backed, contradicted or dead, not {other!r}"
+    text = clean(watch.goal)
+    if not web_address(text) and not citations.cited(text).pages:
+        return citations.NONE_CITED
+    return None
 
 
 def trigger(watch: Watch) -> BaseTrigger:
@@ -176,6 +233,8 @@ _TYPES: dict[str, type] = {
     "notify": list,
     "stop_when_alerted": bool,
     "paused": bool,
+    "check": bool,
+    "cited": bool,
 }
 _TYPE_NAMES = {str: "text", int: "a whole number", list: "a list", bool: "true or false"}
 

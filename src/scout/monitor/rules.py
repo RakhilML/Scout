@@ -10,11 +10,21 @@ Grammar (case-insensitive):
     rise 10%                         a price rose by at least 10%  (also: rises, up)
     mentions "free-threaded"         a new fact contains the text
     in stock                         a published offer is in stock (also: back in stock)
+    supported                        a claim's ruling became supported (also: now supported,
+                                     backed)
+    refuted                          a claim's ruling became refuted or disputed (also:
+                                     disputed, contradicted)
+    dead                             a cited page could not be read twice in a row (also: dead
+                                     links, unreadable)
 
-The first five and "mentions" are events: each change is seen by exactly one run, so each alerts
-once. Price limits and "in stock" are conditions: one alerts when it starts to hold (or when the
-rule is added while it holds), stays quiet while it keeps holding, and can alert again only after
-it stopped holding. A price moving around under the limit is one alert, not one per price.
+A claim watch alerts only on changed, supported and refuted; the last two are its own. A
+citation watch also alerts on dead, which is its own; supported and refuted also fire for a claim
+it first judges after its first run (a sentence added to the text).
+
+Price limits and "in stock" are conditions: one alerts when it starts to hold (or when the rule
+is added while it holds), stays quiet while it keeps holding, and can alert again only after it
+stopped holding. A price moving around under the limit is one alert, not one per price. The other
+rules are events: each change is seen by exactly one run, so each alerts once.
 """
 
 from __future__ import annotations
@@ -26,7 +36,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from scout.errors import ConfigError
+from scout.monitor.claims import PAGE, READ
 from scout.monitor.diff import Change, Delta, Fact
+from scout.research.factcheck import CITED_LABELS
+from scout.research.results import Ruling
 from scout.textutil import fold
 
 # A value change smaller than this does not count as "changed" (prices jitter by cents).
@@ -34,8 +47,26 @@ MATERIAL_PERCENT = Decimal(1)
 # schema.org availability terms under which an offer can be bought now.
 AVAILABLE = frozenset({"InStock", "LimitedAvailability", "OnlineOnly", "InStoreOnly"})
 
-RuleKind = Literal["new", "changed", "below", "above", "drop", "rise", "mentions", "in_stock"]
+RuleKind = Literal[
+    "new",
+    "changed",
+    "below",
+    "above",
+    "drop",
+    "rise",
+    "mentions",
+    "in_stock",
+    "supported",
+    "refuted",
+    "dead",
+]
 CONDITIONS: frozenset[RuleKind] = frozenset({"below", "above", "in_stock"})
+CLAIM_RULES: frozenset[RuleKind] = frozenset({"changed", "supported", "refuted"})
+CITED_RULES: frozenset[RuleKind] = CLAIM_RULES | {"dead"}
+# Rulings on each side, as a fact-check and as a cite-check word them.
+_FOR = (Ruling.SUPPORTED, CITED_LABELS[Ruling.SUPPORTED])
+_AGAINST = (Ruling.REFUTED, CITED_LABELS[Ruling.REFUTED])
+_UNSETTLED = (Ruling.UNCLEAR, CITED_LABELS[Ruling.UNCLEAR])
 
 _NUMBER = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
 _CURRENCY = r"(?:\s*([A-Za-z]{3}))?"
@@ -54,6 +85,9 @@ _PATTERNS: tuple[tuple[RuleKind, re.Pattern[str]], ...] = (
     ("rise", _words(rf"^(?:price )?(?:rises?|up)(?: by)?\s*{_NUMBER}\s*%$")),
     ("mentions", _words(r"^mentions\s+[\"']?(.+?)[\"']?$")),
     ("in_stock", _words(r"^(?:back )?in stock$")),
+    ("supported", _words(r"^(?:now )?(?:supported|backed)$")),
+    ("refuted", _words(r"^(?:now )?(?:refuted|contradicted|disputed)$")),
+    ("dead", _words(r"^(?:dead(?: links?)?|unreadable)$")),
 )
 
 
@@ -92,7 +126,9 @@ def parse_rule(text: str) -> Rule:
         return Rule(kind, text)
     raise ConfigError(
         f"cannot understand the alert rule {text!r}. Try: new, changed, price below 1800 USD, "
-        'price above 2500, drop 5%, rise 10%, mentions "text", in stock'
+        'price above 2500, drop 5%, rise 10%, mentions "text", in stock; '
+        "for a claim watch: changed, supported, refuted; "
+        "for a citation watch: changed, backed, contradicted, dead"
     )
 
 
@@ -174,7 +210,7 @@ def _new(rule: Rule, delta: Delta, baseline: bool) -> str | None:
 
 def _changed(rule: Rule, delta: Delta, baseline: bool) -> str | None:
     fact = delta.fact
-    if baseline:
+    if baseline or fact.key.startswith(PAGE):
         return None
     if delta.change is Change.GONE:
         return f"no longer on {fact.site}: {fact.claim}"
@@ -207,6 +243,42 @@ def _mentions(rule: Rule, delta: Delta, baseline: bool) -> str | None:
     return f"mentions {rule.phrase!r}: {fact.claim}"
 
 
+def _ruling(rule: Rule, delta: Delta, baseline: bool) -> str | None:
+    """A claim watch's ruling that changed to this rule's side: supported; or refuted, or
+    disputed because a refutation arrived (not because a support did). A claim first judged
+    after the watch's first run (a sentence added to a cited text) counts as arriving there."""
+    if delta.change is Change.NEW and not baseline:
+        was = None
+    elif delta.change is Change.CHANGED and delta.previous is not None:
+        was = delta.previous.value
+    else:
+        return None
+    now = delta.fact.value
+    if rule.kind == "supported":
+        fires = now in _FOR
+    else:
+        arrived = now == Ruling.DISPUTED and (was is None or was in (*_FOR, *_UNSETTLED))
+        fires = now in _AGAINST or arrived
+    return f"now {now}: {delta.fact.claim}" if fires else None
+
+
+def _dead(rule: Rule, delta: Delta, baseline: bool) -> str | None:
+    """A cited page that was read and could not be read again, two runs in a row."""
+    fact, was = delta.fact, delta.previous
+    if not fact.key.startswith(PAGE) or delta.change is not Change.CHANGED or was is None:
+        return None
+    if was.value != READ or fact.value == READ:
+        return None
+    return dead_reason(fact)
+
+
+def dead_reason(fact: Fact, archived: str = "") -> str:
+    """A dead cited page's alert, with what the archive holds of it (*archived*) if told:
+    "dead: URL (not found: HTTP 404; archived 2026-09-28 with the quote), cited for: CLAIM"."""
+    why = f"{fact.value}; {archived}" if archived else fact.value
+    return f"dead: {fact.url} ({why}), cited for: {fact.claim}"
+
+
 def _label(fact: Fact) -> str:
     return f"{fact.entity}: {fact.value}" if fact.entity and fact.value else fact.claim
 
@@ -217,4 +289,7 @@ _EVENTS: dict[str, Callable[[Rule, Delta, bool], str | None]] = {
     "drop": _move,
     "rise": _move,
     "mentions": _mentions,
+    "supported": _ruling,
+    "refuted": _ruling,
+    "dead": _dead,
 }

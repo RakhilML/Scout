@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -7,7 +8,8 @@ import pytest
 from scout.errors import ConfigError
 from scout.monitor.diff import Change, Delta, Fact, diff, facts_from
 from scout.monitor.rules import cleared, parse_rule, triggers
-from scout.monitor.watches import Watch, WatchBook
+from scout.monitor.watches import CHECK_TEXT_LIMIT, Watch, WatchBook
+from scout.research.citations import NONE_CITED
 from scout.research.results import Confidence, Finding, Plan, RunResult, Source, Verdict
 from scout.research.values import offer_findings
 from scout.web.extract import Offer
@@ -30,6 +32,15 @@ from tests.helpers import NOW
         ('mentions "free-threaded"', "mentions", {"phrase": "free-threaded"}),
         ('Mentions "JIT"', "mentions", {"phrase": "JIT"}),  # shown as written, matched in any case
         ("back in stock", "in_stock", {}),
+        ("supported", "supported", {}),
+        ("Now supported", "supported", {}),
+        ("now refuted", "refuted", {}),
+        ("disputed", "refuted", {}),
+        ("backed", "supported", {}),
+        ("now contradicted", "refuted", {}),
+        ("dead", "dead", {}),
+        ("dead links", "dead", {}),
+        ("Unreadable", "dead", {}),
     ],
 )
 def test_rules_parse(text, kind, fields):
@@ -69,6 +80,79 @@ def test_new_and_changed_are_quiet_on_the_baseline_run():
     assert fired("new", [new], baseline=True) == []
     (trigger,) = fired("new", [new])
     assert trigger.reason == "new: RTX 5090 costs $1999"
+
+
+CLAIM = "Python 3.14 is the latest stable version of Python."
+
+
+def ruling(value, change=Change.CHANGED, was="supported"):
+    now = Fact(
+        key="claim|a1b2c3",
+        claim=CLAIM,
+        quote="Python 3.15.0 is the latest stable release of Python.",
+        url="https://www.python.org/downloads/",
+        seen=NOW,
+        entity=CLAIM.removesuffix("."),
+        value=value,
+    )
+    return Delta(change, now, replace(now, value=was))
+
+
+def test_claim_rules_alert_when_a_page_moved_a_ruling_their_way():
+    def reasons(rule_text, delta, *, baseline=False):
+        return [trigger.reason for trigger in fired(rule_text, [delta], baseline=baseline)]
+
+    assert reasons("refuted", ruling("refuted")) == [f"now refuted: {CLAIM}"]
+    assert reasons("now refuted", ruling("disputed")) == [f"now disputed: {CLAIM}"]
+    assert reasons("supported", ruling("supported", was="unclear")) == [f"now supported: {CLAIM}"]
+    assert reasons("supported", ruling("refuted")) == []
+    assert reasons("refuted", ruling("unclear")) == []
+    assert reasons("refuted", ruling("supported", was="refuted")) == []
+    # A model reading unchanged pages differently, and a first run, alert nobody.
+    assert reasons("refuted", ruling("refuted", Change.NOTICED)) == []
+    assert reasons("changed", ruling("refuted", Change.NOTICED)) == []
+    assert reasons("refuted", ruling("refuted", Change.NEW), baseline=True) == []
+    assert reasons("changed", ruling("refuted")) == [
+        f"changed: {CLAIM.removesuffix('.')}: supported \N{RIGHTWARDS ARROW} refuted"
+    ]
+
+
+DEAD = "https://three.example/stations"
+
+
+def page(value, change=Change.CHANGED, was="read"):
+    now = Fact(
+        key=f"page|{DEAD}", claim=CLAIM, quote="It said so.", url=DEAD, seen=NOW, value=value
+    )
+    return Delta(change, now, replace(now, value=was))
+
+
+def test_citation_rules_read_cite_check_labels_and_tell_dead_pages():
+    def reasons(rule_text, delta, *, baseline=False):
+        return [trigger.reason for trigger in fired(rule_text, [delta], baseline=baseline)]
+
+    assert reasons("backed", ruling("backed", was="not found")) == [f"now backed: {CLAIM}"]
+    assert reasons("contradicted", ruling("contradicted", was="backed")) == [
+        f"now contradicted: {CLAIM}"
+    ]
+    assert reasons("contradicted", ruling("disputed", was="backed")) == [f"now disputed: {CLAIM}"]
+    assert reasons("contradicted", ruling("disputed", was="contradicted")) == []
+    assert reasons("backed", ruling("contradicted", was="backed")) == []
+    # A claim first judged after the first run (a sentence added to the text) arrives on a side.
+    assert reasons("contradicted", ruling("contradicted", Change.NEW)) == [
+        f"now contradicted: {CLAIM}"
+    ]
+    assert reasons("contradicted", ruling("contradicted", Change.NEW), baseline=True) == []
+    assert reasons("changed", ruling("contradicted", Change.NEW)) == []
+
+    gone = "not found: HTTP 404"
+    assert reasons("dead", page(gone)) == [f"dead: {DEAD} ({gone}), cited for: {CLAIM}"]
+    assert reasons("dead", page("read", was=gone)) == []  # back
+    assert reasons("dead", page(gone, Change.NEW)) == []  # unreadable from the start
+    assert reasons("dead", page(gone, Change.SAME)) == []
+    assert reasons("dead", ruling("contradicted")) == []
+    assert reasons("changed", page(gone)) == []
+    assert reasons("changed", Delta(Change.GONE, page(gone).fact)) == []
 
 
 def test_changed_needs_a_material_move_or_a_disappearance():
@@ -364,6 +448,66 @@ def test_invalid_watches_are_rejected(changes, message):
         watch(**changes)
 
 
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"goal": "https://example.com/a"}, "a claim watch checks a text, not a web address"),
+        ({"goal": "word " * 301}, "a claim watch checks at most 1500 characters of text"),
+        ({"kind": "news"}, "a claim watch has no kind or recency"),
+        ({"recency": "week"}, "a claim watch has no kind or recency"),
+        (
+            {"alerts": ("changed", "price below 5")},
+            "a claim watch alerts on changed, supported or refuted, not 'price below 5'",
+        ),
+    ],
+)
+def test_invalid_claim_watches_are_rejected(changes, message):
+    with pytest.raises(ConfigError, match=f"^watch 'gpu-watch': {re.escape(message)}$"):
+        watch(**({"goal": CLAIM, "check": True} | changes))
+
+
+def test_claim_watches_check_short_texts_and_have_rules_of_their_own():
+    assert watch(goal="x" * 1500, check=True, alerts=("now refuted", "supported")).check
+    assert watch(goal=f"https://python.org says: {CLAIM}", check=True).check  # a text
+    for rule in ("supported", "disputed"):
+        with pytest.raises(ConfigError, match=f"only a claim watch alerts on '{rule}'"):
+            watch(alerts=(rule,))
+
+
+CITING = f"{CLAIM} [1]\n\n[1] https://www.python.org/downloads/"
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"check": False}, "a citation watch needs check: true"),
+        ({"kind": "news"}, "a citation watch reads only the pages its text cites"),
+        ({"recency": "week"}, "a citation watch reads only the pages its text cites"),
+        ({"region": "de-de"}, "a citation watch reads only the pages its text cites"),
+        ({"max_results": 3}, "a citation watch reads only the pages its text cites"),
+        (
+            {"alerts": ("dead", "new")},
+            "a citation watch alerts on changed, backed, contradicted or dead, not 'new'",
+        ),
+        ({"goal": CLAIM}, NONE_CITED),
+    ],
+)
+def test_invalid_citation_watches_are_rejected(changes, message):
+    with pytest.raises(ConfigError, match=f"^watch 'gpu-watch': {re.escape(message)}$"):
+        watch(**({"goal": CITING, "check": True, "cited": True} | changes))
+
+
+def test_citation_watches_take_addresses_and_long_texts_and_alone_alert_on_dead_pages():
+    page = "https://en.wikipedia.org/wiki/Python_Software_Foundation"
+    assert watch(goal=page, check=True, cited=True, alerts=("dead links", "backed")).cited
+    long = f"{CLAIM} [1] " * 40 + "\n\n[1] https://www.python.org/downloads/"
+    assert len(long) > CHECK_TEXT_LIMIT
+    assert watch(goal=long, check=True, cited=True).cited
+    for kind in ({}, {"goal": CLAIM, "check": True}):
+        with pytest.raises(ConfigError, match=r"only a citation watch alerts on 'dead'$"):
+            watch(alerts=("dead",), **kind)
+
+
 def test_watch_book_round_trip_and_editing(tmp_path):
     book = WatchBook(tmp_path / "watches.yaml")
     assert book.load() == []
@@ -380,6 +524,28 @@ def test_watch_book_round_trip_and_editing(tmp_path):
     assert [w.name for w in book.load()] == ["gpu-watch"]
     with pytest.raises(ConfigError, match="no watch named"):
         book.remove("py")
+
+
+def test_a_claim_watch_is_marked_in_the_file_and_other_watches_are_not(tmp_path):
+    book = WatchBook(tmp_path / "watches.yaml")
+    claims = watch(name="py", goal=CLAIM, check=True, alerts=("refuted",))
+    book.add(watch())
+    book.add(claims)
+    text = (tmp_path / "watches.yaml").read_text(encoding="utf-8")
+    assert text.count("check:") == 1
+    assert "check: true" in text
+    assert book.load() == [watch(), claims]
+    book.save(book.load())
+    assert (tmp_path / "watches.yaml").read_text(encoding="utf-8") == text
+
+
+def test_a_citation_watch_is_marked_in_the_file(tmp_path):
+    book = WatchBook(tmp_path / "watches.yaml")
+    cited = watch(name="psf", goal=CITING, check=True, cited=True, alerts=("dead",))
+    book.add(cited)
+    text = (tmp_path / "watches.yaml").read_text(encoding="utf-8")
+    assert ("check: true" in text, "cited: true" in text) == (True, True)
+    assert book.load() == [cited]
 
 
 def test_watch_book_rejects_bad_files(tmp_path):

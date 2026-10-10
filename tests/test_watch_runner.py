@@ -225,6 +225,19 @@ def test_digest_lists_each_alert_with_its_evidence(world):
     ]
 
 
+def test_an_alert_links_to_its_quote_on_the_page_the_run_read(world):
+    world.run(GPU, extraction(price_at_shop("$1,999")))
+    world.web.pages[SHOP] = shop_page("$1,849")
+    world.run(GPU, extraction(price_at_shop("$1,849")))
+
+    deep = f"{SHOP}#:~:text=The%20RTX%205090%20Founders,%241%2C849%20at%20Shop%20A."
+    assert [alert.link for alert in world.app.store.alerts("gpu")] == [deep, deep]
+    (_, body), *_ = world.inbox.sent
+    assert body.count(f"\n  {deep}\n") == 2
+    feed = world.app.settings.feed_path("gpu").read_text(encoding="utf-8")
+    assert f'href="{deep}"' in feed
+
+
 def test_one_run_of_a_watch_at_a_time(world):
     held = FileLock(world.app.settings.data_dir / "locks" / "gpu.lock", wait=False)
     with held, pytest.raises(ConfigError, match="'gpu' is already running"):

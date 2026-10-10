@@ -25,7 +25,7 @@ def atom(watch: Watch, alerts: Sequence[AlertRecord], *, now: datetime) -> str:
     feed = ET.Element(f"{{{_ATOM}}}feed")
     _add(feed, "id", _id(f"scout:watch:{watch.name}"))
     _add(feed, "title", f"Scout: {watch.name}")
-    _add(feed, "subtitle", watch.goal)
+    _add(feed, "subtitle", watch.label)
     _add(feed, "updated", (alerts[0].created_at if alerts else now).isoformat())
     _add(feed, "generator", f"Scout {__version__}")
     _add(ET.SubElement(feed, f"{{{_ATOM}}}author"), "name", "Scout")
@@ -35,7 +35,7 @@ def atom(watch: Watch, alerts: Sequence[AlertRecord], *, now: datetime) -> str:
         _add(entry, "title", alert.reason)
         _add(entry, "updated", alert.created_at.isoformat())
         if alert.url.startswith(("https://", "http://")):
-            ET.SubElement(entry, f"{{{_ATOM}}}link", href=alert.url)
+            ET.SubElement(entry, f"{{{_ATOM}}}link", href=alert.link)
         _add(entry, "summary", alert.quote or alert.reason)
     return ET.tostring(feed, encoding="unicode", xml_declaration=True)
 
