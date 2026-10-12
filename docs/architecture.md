@@ -81,10 +81,10 @@ Scout uses the src layout: the package is `src/scout/`. The `scout` command call
 
 | Module | Job |
 |---|---|
-| `llm/__init__.py` | `make_backend()` makes the backend that `SCOUT_LLM` names: `openai`, `exchange:DIR`, `replay:DIR` or `record:DIR`. `model_server()` finds the server behind a wrapper. |
+| `llm/__init__.py` | `make_backend()` makes the backend that `SCOUT_LLM` names: `openai`, `exchange:DIR`, `replay:DIR` or `record:DIR`. `model_server()` finds the server behind a wrapper. `named_server()` makes the server client from the settings alone, with no model id, for `scout models`. |
 | `llm/base.py` | The `Backend` protocol, `Message`, `CompletionRequest` and `Completion`. |
 | `llm/openai_compat.py` | `OpenAICompatBackend`: chat completions on an OpenAI-compatible server (LM Studio, Ollama, llama.cpp, vLLM). It turns server errors into `LLMError` subclasses. |
-| `llm/exchange.py` | `ExchangeBackend`: files as a model API, in the modes `answer`, `replay` and `record`. The request key is a hash of the model, the messages, the schema and the temperature. |
+| `llm/exchange.py` | `ExchangeBackend`: files as a model API, in the modes `answer`, `replay` and `record`. The request key is a hash of the model, the messages, the schema and the temperature. In record mode it keeps `session.json` (`Session`): the model, the context window, the page size (`SCOUT_MAX_PAGE_CHARS`), the structured modes that the requests used, the reasoning levels and the day. It writes the file with the first recorded request, under a `FileLock` (`session.json.lock`), merged with what other processes recorded; a recorder that would ask with another day than a recorded session refuses. Beside each answer it keeps the model's reasoning (`<key>.reasoning.txt`), and for a failed request its error (`<key>.error.json`: any `LLMError` except `AnswerPending`), which replay and exchange mode raise again and record mode asks again. A replay or exchange run on that folder uses all of this, so its requests get the recorded keys and answers. |
 | `llm/routing.py` | `RoutedBackend` sends each request to the backend for its purpose. `make_backend()` uses it to send the `plan` step to `SCOUT_PLANNER_MODEL`. |
 | `llm/structured.py` | `generate()` gets a reply that a pydantic model validates, with one repair request. The modes are `json_schema` and `prompt`. |
 | `llm/probe.py` | `probe()` finds the context window, the reasoning levels and the structured mode of a model (`Capabilities`). |
@@ -171,8 +171,15 @@ closes it at the end. `App` makes these parts:
 - `archive=True` gives the archive to a cite-check.
 
 Before that, `App.capabilities()` gets the model's `Capabilities` from the `models` table. If
-there are none, or they are older than 24 hours, `probe()` asks the server again. After a run,
-`App.learn_from()` stores a structured mode that fell back to `prompt` during the run.
+there are none, or they are older than 24 hours, `probe()` asks the server again. That probe
+does not test the structured mode: it keeps the mode of the expired entry (`known_mode`), and
+only `scout check` tests it again. After a run, `App.learn_from()` stores a structured mode that
+fell back to `prompt` during the run.
+
+With a recorded session (`session.json` in the exchange folder), `App.capabilities()` returns
+the recorded values and asks no server. `App.researcher()` then gives the `Researcher` the
+session's day (`today=`): the prompts, the old-news flags and the confidence use that day, and
+`started_at` stays the real start time. So a replay on a later day builds the recorded requests.
 
 ### Research run
 
@@ -365,11 +372,15 @@ sequenceDiagram
     W-->>D: WatchRun
 ```
 
-1. `run_watch()` takes `FileLock` on `<data dir>/locks/<name>.lock` with `wait=False`. A second
-   run of the same watch stops with an error.
-2. `store.last_runs()` gets the last `EARLIER_RUNS` (5) runs. `continued()` decides if the last
-   run asked the same question. If not, the run starts a new baseline and `store.retire()` sets
-   the old facts aside.
+1. `run_watch()` takes `run_lock()`: the `FileLock` on `<data dir>/locks/<name>.lock` with
+   `wait=False`. A second run of the same watch stops with an error. With `listed_in` (the
+   daemon, `scout watch run` and the MCP tool pass the watches file), it reads the watch again
+   inside the lock: a watch removed meanwhile does not run, and a watch edited meanwhile runs as
+   it is now.
+2. `store.last_runs()` gets the last `EARLIER_RUNS` (5) runs. It leaves out the runs from before
+   the watch was last removed (`forgotten`), so a watch added again starts a new baseline.
+   `continued()` decides if the last run asked the same question. If not, the run starts a new
+   baseline and `store.retire()` sets the old facts aside.
 3. The run calls `app.researcher(fresh=True, scope="watch:<name>")`. A citation watch is always
    public-only. The MCP tool makes every watch run public-only.
 4. A research watch calls `run(goal, plan=previous.plan, reuse=previous)`. It repeats the same
@@ -391,9 +402,22 @@ sequenceDiagram
 12. `write_feed()` writes the 50 newest alerts (`FEED_ENTRIES`) to `feeds/<name>.xml`.
 
 The `Daemon` runs one watch at a time (one worker thread). Every 30 seconds, it reads
-`watches.yaml` again if the modification time of the file changed. If a run fails with a
-`ScoutError` or `AnswerPending`, the daemon tries it again 30 minutes later. It does not try
-again after a `ConfigError`. A `daemon.lock` file allows one daemon at a time.
+`watches.yaml` again if the modification time of the file changed. A watch is due from
+`store.latest_run()`, which also leaves out the runs from before a removal: a watch added again
+is due at once. If a run fails with a `ScoutError` or `AnswerPending`, the daemon tries it again
+30 minutes later. It does not try again after a `ConfigError`. A `daemon.lock` file allows one
+daemon at a time.
+
+The daemon keeps, for each job, the run it was planned from (`_planned_from`). When `sync()`
+reads the watches file again, it plans a job again if the watch changed, or if
+`store.forgot()` says that its run was forgotten since (a watch removed and added again with the
+same settings). A failed run, a queued run or a watch that never ran keeps its retry and its
+interval.
+
+`scout watch remove` takes the same `run_lock()`, then calls `store.forget()`, deletes the feed,
+and takes the entry out of the watches file last. So a run in progress cannot record anything
+after the removal, and a removal that fails part-way leaves the watch listed, to remove again.
+If the watch is running, the command refuses and changes nothing.
 
 ### MCP server
 
@@ -448,7 +472,8 @@ The data folder is `SCOUT_DATA_DIR` (default `~/.scout`).
 | `reports/` | Report files (the default of `SCOUT_OUTPUT_DIR`) | `report.save()` |
 
 With `SCOUT_LLM=exchange:DIR`, the exchange folder holds `DIR/requests/<key>.md` (written by
-Scout) and `DIR/responses/<key>.txt` (written by whoever answers).
+Scout) and `DIR/responses/<key>.txt` (written by whoever answers). A folder that `record:DIR`
+filled also holds `DIR/session.json`.
 
 ### The SQLite store
 
@@ -516,15 +541,16 @@ erDiagram
 | `models` | `Capabilities` for each server, model and context override | `App.capabilities()` |
 | `runs` | Each run: summary columns, and the full `RunResult` JSON in `result` | `add_run()`, `record()` |
 | `knowledge` | Each trusted finding once for each page and quote: the memory of `scout ask`. `hidden` is 1 while a rating says it is wrong. | `add_run()`, `record()`, `put_rating()` |
-| `knowledge_index` | An FTS5 index on `claim`, `quote` and `goal` of `knowledge`. Two triggers keep it current. | SQLite triggers |
+| `knowledge_index` | An FTS5 index on `claim`, `quote` and `goal` of `knowledge`. Three triggers (insert, delete, and an update of those columns) keep it current. | SQLite triggers |
 | `ratings` | The verdicts of `scout rate`, with the finding as it was | `put_rating()` |
 | `sites` | Counters for each site: reads, failures, failures in a row, findings, verified, rated bad | `put_page()`, `add_run()`, `put_rating()` |
 | `facts` | The ledger of each watch: one `Fact` JSON for each key, `active` or `gone` | `record()`, `retire()` |
 | `observations` | The value history of watch facts that have an amount | `record()` |
 | `alerts` | The alerts and their delivery state. A unique index allows one alert with `holding = 1` for each watch and key. | `record()`, `mark_alerts()` |
 | `pins` | What a run read before it stopped to wait, by run key and pin key | `put_pins()`, from `Researcher` |
+| `forgotten` | For each removed watch, its highest run id at removal. `last_runs()`, `latest_run()` and `last_readings()` leave out the runs up to it; `recent_runs()` (`scout history`) keeps them. | `forget()` |
 
-`_MIGRATIONS` is an ordered tuple of SQL scripts (now 9). `PRAGMA user_version` records how
+`_MIGRATIONS` is an ordered tuple of SQL scripts (now 10). `PRAGMA user_version` records how
 many ran. `_migrate()` runs only the scripts after that number. To change the schema:
 
 1. Add a new script at the end of `_MIGRATIONS`.
@@ -673,13 +699,22 @@ Put any new web text or user text through `source_block()` or `_defused()` with 
 - `write_atomic()` writes a temporary file in the same folder, then calls `os.replace()`. A
   reader sees the old file or the new one. On Windows, it tries the replace up to 20 times while
   another process holds the file.
-- `WatchBook.save()` (under a `FileLock`), `write_feed()` and the `--fix` output use it.
+- Every file that Scout writes uses it: `watches.yaml` (`WatchBook.save()`, under a
+  `FileLock`), feeds, report files (`report.save()`), the `--fix` output, `scout export`,
+  `scout ratings --export`, `scout watch trend --csv`, eval cases and scores, the exchange files
+  (requests, answers and `session.json`) and the service files.
+- It writes the text as given, with no newline translation: Scout writes `"\n"` line ends on
+  every system. The Windows service script keeps its `"\r\n"`, and the trend CSV keeps the
+  `"\r\n"` of the `csv` module.
+- A symbolic link at the path is followed, as `open()` follows it: the link stays, and the file
+  it points to gets the text (a dangling link makes its target).
+- On POSIX, a replaced file keeps its mode, and a new file gets `mode` less the umask: `0o666`
+  by default, as `open()` gives. `WatchBook.save()` passes `mode=0o600`, because notification
+  URLs often hold tokens. A loop of links is an `OSError` (`ELOOP`).
 - `FileLock` uses `msvcrt.locking()` on Windows and `fcntl.flock()` on other systems. The watch
-  runs, the daemon and the watches file use it.
+  runs, `scout watch remove`, the daemon and the watches file use it.
 
-> [!NOTE]
-> Report files, `scout export`, `scout ratings --export`, eval files, exchange files and service
-> files are written with `Path.write_text()` or `open("w")`, not with `write_atomic()`.
+To write a new file, use `write_atomic()`. Do not use `Path.write_text()` or `open("w")`.
 
 ### Expected errors
 
@@ -735,6 +770,8 @@ Other tools in the suite:
 - click's `CliRunner` runs commands.
 - `pytest.importorskip()` skips the tests of an extra that is not installed (`apprise`, `mcp`,
   `playwright`).
+- `pytest_configure()` in `tests/conftest.py` sets `COLUMNS=100` before the CLI is imported, so
+  rich wraps tables at the same width on every machine.
 
 ### Live tests
 
