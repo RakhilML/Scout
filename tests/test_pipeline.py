@@ -15,7 +15,7 @@ from scout.errors import (
 from scout.llm.base import Completion, CompletionRequest
 from scout.llm.structured import StructuredMode
 from scout.research.pipeline import Researcher, ResearchOptions, source_budget
-from scout.research.results import Flag, Plan, Verdict
+from scout.research.results import Flag, Plan, Source, Verdict
 from scout.store import Store
 from scout.web.extract import Offer
 from scout.web.fetch import Document, FetchStatus
@@ -439,3 +439,61 @@ def test_a_carried_over_news_run_still_ages():
     later = run(reuse=first)
     assert later.carried_over
     assert Flag.STALE in {finding.flag for finding in later.findings}
+
+
+@pytest.mark.parametrize(
+    ("recency", "published", "day", "own", "fixed"),
+    [
+        ("week", date(2026, 9, 5), date(2026, 9, 8), (Flag.STALE, "low"), (None, "medium")),
+        ("month", date(2026, 8, 16), date(2026, 8, 21), (None, "low"), (None, "medium")),
+    ],
+    ids=["stale", "old news"],
+)
+def test_a_fixed_day_is_the_day_of_the_prompts_the_stale_flags_and_the_confidence(
+    recency, published, day, own, fixed
+):
+    """A recorded session's day: a replay on a later day asks and judges as the recording
+    did. Only its start time is its own."""
+    dated = Document(
+        url=SHOP_A, status=FetchStatus.OK, fetched_at=NOW, text=PAGES[SHOP_A], published=published
+    )
+    plan = {"queries": ["rtx 5090 price"], "kind": "news", "recency": recency}
+
+    def run(today):
+        backend = ScriptedBackend({"plan": [plan], "extract": [EXTRACTION]})
+        result = Researcher(
+            search=FakeSearch(SEARCH),
+            fetcher=FakeFetcher({SHOP_A: dated}),
+            backend=backend,
+            clock=Clock(),
+            today=today,
+        ).run(GOAL)
+        assert backend.purposes() == ["plan", "extract"]
+        return result, [request.messages[0].content for request in backend.requests]
+
+    result, prompts = run(None)
+    assert (result.findings[0].flag, result.confidence.level) == own
+    assert all(f"Today is {NOW.date()}." in prompt for prompt in prompts)
+    result, prompts = run(day)
+    assert (result.findings[0].flag, result.confidence.level) == fixed
+    assert all(f"Today is {day}." in prompt for prompt in prompts)
+    assert result.started_at == NOW
+
+
+def test_a_fixed_day_is_the_day_of_reanalysis_and_fact_checks():
+    day = date(2026, 9, 8)
+    backend = ScriptedBackend({"extract": [EXTRACTION], "claims": [LLMUnavailable("stop")]})
+    fixed = Researcher(
+        search=FakeSearch(SEARCH),
+        fetcher=FakeFetcher(PAGES),
+        backend=backend,
+        clock=Clock(),
+        today=day,
+    )
+    page = Source(1, SHOP_A, "RTX 5090", "shop-a.example", "ok", "q", text=PAGES[SHOP_A])
+    plan = Plan(queries=("rtx 5090 price",), kind="price", recency=None, planner="model")
+    assert fixed.reanalyze(GOAL, plan, [page]).started_at == NOW
+    with pytest.raises(LLMUnavailable):
+        fixed.check("The RTX 5090 Founders Edition sells for $1,999 at Shop A.")
+    assert backend.purposes() == ["extract", "claims"]
+    assert all(f"Today is {day}." in request.messages[0].content for request in backend.requests)

@@ -184,6 +184,34 @@ def test_editing_the_goal_plans_again_and_starts_a_new_baseline(world):
     assert reasons(outcome) == ["price below 1900 USD: RTX 5090 Founders Edition: $1,849"]
 
 
+def test_a_watch_removed_and_added_again_starts_a_new_baseline(world):
+    world.run(GPU, extraction(price_at_shop("$1,999"), said(FALLING)))
+    world.run(GPU)
+    world.app.store.forget(GPU.name)  # scout watch remove, then scout watch add
+    world.model.add("plan", PLAN)
+    world.web.pages[SHOP] = shop_page("$1,849")
+    again = world.run(GPU, extraction(price_at_shop("$1,849"), said(FALLING)))
+
+    assert world.last_calls == ["plan", "extract"]
+    assert again.baseline
+    assert again.counts == {Change.NEW: 2}  # as for a new watch: nothing was there before
+    assert reasons(again) == ["price below 1900 USD: RTX 5090 Founders Edition: $1,849"]
+    later = world.run(GPU)
+    assert (world.last_calls, later.baseline, later.counts) == ([], False, {Change.SAME: 2})
+
+
+def test_a_watch_that_found_nothing_trusted_keeps_its_searches_and_tells_what_is_new(world):
+    watch = replace(GPU, alerts=("new",))
+    first = world.run(watch, extraction())
+    assert (first.baseline, world.app.store.facts(watch.name)) == (True, [])
+
+    world.web.pages[SHOP] = shop_page("$1,849")
+    second = world.run(watch, extraction(price_at_shop("$1,849")))
+    assert world.last_calls == ["extract"]  # the plan is reused
+    assert not second.baseline
+    assert reasons(second) == ["new: Shop A sells the RTX 5090 FE for $1,849"]
+
+
 def test_a_watch_that_stops_when_alerted_is_paused(world):
     watch = Watch(
         name="drop",
@@ -223,6 +251,19 @@ def test_digest_lists_each_alert_with_its_evidence(world):
         "",
         "details: scout watch changes gpu",
     ]
+
+
+def test_an_alert_links_to_its_quote_on_the_page_the_run_read(world):
+    world.run(GPU, extraction(price_at_shop("$1,999")))
+    world.web.pages[SHOP] = shop_page("$1,849")
+    world.run(GPU, extraction(price_at_shop("$1,849")))
+
+    deep = f"{SHOP}#:~:text=The%20RTX%205090%20Founders,%241%2C849%20at%20Shop%20A."
+    assert [alert.link for alert in world.app.store.alerts("gpu")] == [deep, deep]
+    (_, body), *_ = world.inbox.sent
+    assert body.count(f"\n  {deep}\n") == 2
+    feed = world.app.settings.feed_path("gpu").read_text(encoding="utf-8")
+    assert f'href="{deep}"' in feed
 
 
 def test_one_run_of_a_watch_at_a_time(world):

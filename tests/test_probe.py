@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 import responses
@@ -103,6 +104,48 @@ def test_context_override_wins():
     assert (
         probe(OpenAICompatBackend(BASE, "qwen3-8b"), context_override=4096).context_tokens == 4096
     )
+
+
+@responses.activate
+def test_a_probe_that_does_not_test_keeps_the_known_mode_but_not_for_gpt_oss():
+    responses.add(responses.GET, MODELS, json=lmstudio("qwen3-8b"))
+    kept = probe(OpenAICompatBackend(BASE, "qwen3-8b"), known_mode=StructuredMode.SCHEMA)
+    assert kept.structured_mode is StructuredMode.SCHEMA
+    assert "json_schema mode (kept from before)" in kept.note
+    gpt_oss = OpenAICompatBackend(BASE, "openai/gpt-oss-20b")
+    assert probe(gpt_oss, known_mode=StructuredMode.SCHEMA).structured_mode is StructuredMode.PROMPT
+    assert not any(call.request.url == CHAT for call in responses.calls)
+
+
+class Fell:
+    """A researcher whose run fell back to prompt mode."""
+
+    structured_mode = StructuredMode.PROMPT
+
+
+@responses.activate
+def test_the_structured_mode_outlives_the_daily_probe_until_scout_check_tests_again(
+    tmp_path, monkeypatch
+):
+    responses.add(responses.GET, MODELS, json=lmstudio("qwen3-8b"))
+    responses.add(responses.POST, CHAT, json=chat('{"ok": true, "word": "scout"}'))
+    settings = Settings(
+        llm="openai",
+        llm_base_url=BASE,
+        llm_model="qwen3-8b",
+        data_dir=tmp_path,
+        reports_dir=tmp_path / "reports",
+    )
+    with App(settings) as app:
+        assert app.capabilities(refresh=True, test_structured=True).structured_mode == "json_schema"
+        monkeypatch.setattr("scout.app.CAPABILITIES_TTL", timedelta(0))  # a day later
+        asked = len(responses.calls)
+        assert app.capabilities().structured_mode is StructuredMode.SCHEMA
+        assert [call.request.url for call in responses.calls[asked:]] == [MODELS]  # no test
+
+        app.learn_from(Fell())  # json_schema failed in a run
+        assert app.capabilities().structured_mode is StructuredMode.PROMPT
+        assert app.capabilities(refresh=True, test_structured=True).structured_mode == "json_schema"
 
 
 def test_capabilities_round_trip():

@@ -5,6 +5,7 @@ appears in that quote, the source's title or the source's dates. A quote may dif
 the page (extraction and tokenization differ between the page and what the model saw), but never
 in a number. A quote found in a different source than the one cited is re-attributed rather than
 rejected. The price lines Scout adds from a page's schema.org data count as part of that source.
+Where on its page a quote was found is kept, so that links can open the page at it.
 
 A fact-check is stricter: the claim is under test, so the quote alone must state its numbers,
 single digits included.
@@ -13,9 +14,11 @@ single digits included.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from typing import NamedTuple
 
 from rapidfuzz import fuzz
 
@@ -24,13 +27,16 @@ from scout.research.results import Confidence, Finding, Flag, Source, Verdict
 from scout.research.schema import ModelFinding
 from scout.textutil import MAGNITUDE_PATTERN, MAGNITUDES, clean, fold
 from scout.web.domains import hostname
+from scout.web.fragments import directive
 
 QUOTE_MATCH_THRESHOLD = 90  # rapidfuzz partial_ratio on folded text, 0-100
 _MAX_QUOTE_CHARS = 400  # long quotes are checked by their opening, which is plenty to anchor them
 MIN_QUOTE_CHARS = 12
+_UNSPACED = 30  # characters: a "word" this long is text written without spaces
 # The word boundary guards only the magnitude: extracted tables glue cells together
 # ("Amazon$3299current", "$2073mid-range"), and those numbers must still be read.
 _NUMBER = re.compile(rf"(\d[\d,]*(?:\.\d+)?)(?:\s*({MAGNITUDE_PATTERN})\b)?", re.IGNORECASE)
+_VERSION = re.compile(r"\d+(?:\.\d+){2,}")  # "3.13.0", "10.0.0.1", "2024.10.07"
 _CURRENCY = re.compile("[$\N{EURO SIGN}\N{POUND SIGN}\N{YEN SIGN}\N{INDIAN RUPEE SIGN}]\\s?$")
 _STALE_NEWS_DAYS = 30
 # A fact-check compares single digits, and pages write small numbers as words ("two moons").
@@ -45,7 +51,8 @@ def verify(
     for it, and every digit counts."""
     by_index = {source.index: source for source in sources}
     folded = {source.index: fold(evidence(source)) for source in sources}
-    return [_verify_one(finding, by_index, folded, strict) for finding in findings]
+    words: dict[int, Words] = {}  # each page's, mapped once a call when a quote is on it
+    return [_verify_one(finding, by_index, folded, strict, words) for finding in findings]
 
 
 def evidence(source: Source) -> str:
@@ -56,12 +63,18 @@ def evidence(source: Source) -> str:
 
 
 def _verify_one(
-    found: ModelFinding, sources: dict[int, Source], folded: dict[int, str], strict: bool
+    found: ModelFinding,
+    sources: dict[int, Source],
+    folded: dict[int, str],
+    strict: bool,
+    words: dict[int, Words],
 ) -> Finding:
     # The model may withhold trust from a fact (the page makes it doubtful), never grant it.
     doubt = f"doubtful: {clean(found.doubt)}" if found.doubt and found.doubt.strip() else None
 
-    def result(source: int, verdict: Verdict, note: str | None = None) -> Finding:
+    def result(
+        source: int, verdict: Verdict, note: str | None = None, anchor: str | None = None
+    ) -> Finding:
         return Finding(
             claim=clean(found.claim),
             quote=clean(found.quote),
@@ -72,6 +85,7 @@ def _verify_one(
             value=clean(found.value) if found.value else None,
             flag=Flag.DOUBTED if doubt else None,
             note="; ".join(part for part in (note, doubt) if part) or None,
+            anchor=anchor,
         )
 
     quote = fold(found.quote)[:_MAX_QUOTE_CHARS]
@@ -84,6 +98,9 @@ def _verify_one(
         if locate(folded[index], quote, min_digits=digits) is None:
             continue
         source = sources[index]
+        if index not in words and not source.snippet_only:
+            words[index] = Words.of(source.text)
+        anchor = _anchor(source, quote, digits, words.get(index))
         dates = " ".join(d.isoformat() for d in (source.published, source.updated) if d)
         stated = quote if strict else f"{quote} {fold(source.title)} {dates}"
         missing = numbers(fold(f"{found.claim} {found.value or ''}"), min_digits=digits) - numbers(
@@ -91,12 +108,21 @@ def _verify_one(
         )
         if missing:
             listed = ", ".join(sorted(missing))
-            return result(index, Verdict.UNVERIFIED, f"the quote does not contain {listed}")
+            return result(index, Verdict.UNVERIFIED, f"the quote does not contain {listed}", anchor)
         notes = [f"quote is from source {index}"] if index != found.source else []
         if source.snippet_only:
             notes.append("quoted from the search result: the page itself could not be read")
-        return result(index, Verdict.VERIFIED, "; ".join(notes) or None)
+        return result(index, Verdict.VERIFIED, "; ".join(notes) or None, anchor)
     return result(found.source, Verdict.UNVERIFIED, "quote not found in the source")
+
+
+def _anchor(source: Source, quote: str, min_digits: int, words: Words | None) -> str | None:
+    """Where on its page the (folded) *quote* is, for links that open the page at it: never in
+    a search snippet, which is not the page, nor in the price lines Scout wrote."""
+    if source.snippet_only or words is None:
+        return None
+    span = span_of(source.text, quote, min_digits=min_digits, words=words)
+    return directive(source.text, *span) if span else None
 
 
 def quoted_in(text: str, quote: str) -> bool:
@@ -122,6 +148,63 @@ def locate(text: str, quote: str, *, min_digits: int = 2) -> tuple[int, int] | N
     return None
 
 
+def span_of(
+    text: str, quote: str, *, min_digits: int = 2, words: Words | None = None
+) -> tuple[int, int] | None:
+    """Where the folded *quote* is in *text* as written: the whole words of *text* that
+    locate() matches in its words folded (*words*, mapped already). A near match that missed
+    the quote's first or last word by one takes it back. In a word so long it is text without
+    spaces (Chinese, Japanese), the match is cut to the character."""
+    words = words or Words.of(text)
+    found = locate(words.joined, quote, min_digits=min_digits)
+    if found is None:
+        return None
+    first = bisect_right(words.starts, found[0]) - 1
+    last = bisect_left(words.starts, found[1]) - 1
+    said = quote.split()
+    if first > 0 and words.folded[first] != said[0] == words.folded[first - 1]:
+        first -= 1
+    if last + 1 < len(words.folded) and words.folded[last] != said[-1] == words.folded[last + 1]:
+        last += 1
+    begin, end = words.spans[first][0], words.spans[last][1]
+    if words.unspaced(first):
+        begin += max(0, found[0] - words.starts[first])
+    if words.unspaced(last):
+        end = words.spans[last][0] + min(len(words.folded[last]), found[1] - words.starts[last])
+    return begin, end
+
+
+class Words(NamedTuple):
+    """A page's words folded, so a folded quote can be placed on them and mapped back to the
+    page as written: folding changes lengths ("\N{LATIN SMALL LETTER SHARP S}" is "ss")."""
+
+    joined: str  # the folded words, joined by single spaces
+    folded: tuple[str, ...]
+    starts: tuple[int, ...]  # where each starts in joined
+    spans: tuple[tuple[int, int], ...]  # where each is in the page's text
+
+    @classmethod
+    def of(cls, text: str) -> Words:
+        folded: list[str] = []
+        starts: list[int] = []
+        spans: list[tuple[int, int]] = []
+        at = 0
+        for match in re.finditer(r"\S+", text):
+            word = fold(match[0])
+            if not word:  # an invisible character alone
+                continue
+            folded.append(word)
+            starts.append(at)
+            spans.append(match.span())
+            at += len(word) + 1
+        return cls(" ".join(folded), tuple(folded), tuple(starts), tuple(spans))
+
+    def unspaced(self, i: int) -> bool:
+        """Word *i* is text without spaces, folded to as many characters as it is written."""
+        begin, end = self.spans[i]
+        return end - begin == len(self.folded[i]) > _UNSPACED
+
+
 def _whole_words(text: str, start: int, end: int) -> tuple[int, int]:
     """The span start:end widened to whitespace, so a number cut by the match is read whole."""
     while start > 0 and not text[start - 1].isspace():
@@ -141,10 +224,26 @@ def numbers(text: str, *, min_digits: int = 2) -> set[str]:
     return set(numbers_as_written(text, min_digits=min_digits))
 
 
+def _version(written: str) -> str:
+    """A version (or dotted date) as one value: 3.13.0 is 3.13, while 10.0.0.1 stays itself."""
+    groups = written.split(".")
+    while len(groups) > 2 and not groups[-1].strip("0"):
+        groups.pop()
+    if len(groups) > 2:
+        return ".".join(groups)
+    return format(Decimal(".".join(groups)).normalize(), "f")
+
+
 def numbers_as_written(text: str, *, min_digits: int = 2) -> dict[str, str]:
     """numbers(), each with how *text* first writes it. "m" and "b" are million and billion
-    only after a currency sign: "330 m" is a height, "$330m" an amount."""
+    only after a currency sign: "330 m" is a height, "$330m" an amount. A version is one
+    value: "3.13.0" is not 3.13 and 0."""
     found: dict[str, str] = {}
+    for match in _VERSION.finditer(text):
+        value = _version(match[0])
+        if sum(ch.isdigit() for ch in value) >= min_digits:
+            found.setdefault(value, match[0])
+    text = _VERSION.sub(lambda match: " " * len(match[0]), text)
     for match in _NUMBER.finditer(text):
         digits, magnitude = match.groups()
         before = max(0, match.start() - 2)

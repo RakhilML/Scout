@@ -90,6 +90,13 @@ def fold(text: str) -> str:
     return _ANY_WHITESPACE.sub(" ", text).casefold().strip()
 
 
+def shingles(text: str) -> set[tuple[str, ...]]:
+    """The runs of three words of *text*, folded: what two texts have in common is told by how
+    many they share, wherever their layouts differ."""
+    words = fold(text).split()
+    return {tuple(words[i : i + 3]) for i in range(len(words) - 2)}
+
+
 def junk_ratio(text: str) -> float:
     """Share of characters that only appear when binary data is decoded as text."""
     if not text:

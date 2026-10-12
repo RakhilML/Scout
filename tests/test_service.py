@@ -69,6 +69,18 @@ def test_windows_gets_a_windowless_startup_script(tmp_path):
     assert written.count(b"\r\n") == len(script.splitlines())
 
 
+def test_a_service_file_that_fails_to_be_written_leaves_the_one_before_whole(tmp_path):
+    plan = service.plan("linux", python=PYTHON, home=tmp_path, env_file=ENV)
+    service.install(plan, run=Recorder())
+    ((path, unit),) = plan.files.items()
+    # A lone surrogate cannot be written as UTF-8: the write fails halfway, as a crash would.
+    broken = service.ServicePlan(files={path: unit + "\udc80"})
+    with pytest.raises(UnicodeEncodeError):
+        service.install(broken, run=Recorder())
+    assert path.read_bytes() == unit.encode()
+    assert [file.name for file in path.parent.iterdir()] == [path.name]
+
+
 def test_a_failing_service_manager_is_reported(tmp_path):
     plan = service.plan("linux", python=PYTHON, home=tmp_path, env_file=None)
     with pytest.raises(ScoutError, match="systemctl --user daemon-reload failed"):

@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 import responses
 
+from scout.clock import utcnow
 from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.rules import cleared, parse_rule, triggers
 from scout.store import _MIGRATIONS, Store
@@ -251,6 +252,132 @@ def test_existing_runs_are_remembered_when_the_database_is_upgraded(tmp_path):
     old.close()
     with Store(path) as store:
         assert [m.claim for m in store.recall("shop sells")] == ["Shop sells it for $1,999"]
+
+
+def test_alerts_and_memories_kept_before_quotes_were_placed_link_to_their_pages(tmp_path):
+    path = tmp_path / "scout.db"
+    old = sqlite3.connect(path)
+    for number, script in enumerate(_MIGRATIONS[:8], start=1):
+        old.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
+    old.execute(
+        "INSERT INTO alerts (watch, key, run_id, created_at, reason, url, quote, holding) "
+        "VALUES ('gpu', 'k', 1, ?, 'new: RTX 5090: $1799', 'https://shop.example/5090', "
+        "'Now $1799.', 0)",
+        (NOW.isoformat(),),
+    )
+    old.execute(
+        "INSERT INTO knowledge (url, quote, claim, goal, run_id, first_seen, last_seen) "
+        "VALUES ('https://shop.example/5090', 'Now $1,999 at Shop.', 'Shop sells it for $1,999',"
+        " 'rtx', 1, ?, ?)",
+        (NOW.isoformat(), NOW.isoformat()),
+    )
+    old.commit()
+    old.close()
+    with Store(path) as store:
+        assert store.schema_version == len(_MIGRATIONS) == 10
+        (alert,) = store.alerts("gpu")
+        assert (alert.reason, alert.anchor, alert.link) == (
+            "new: RTX 5090: $1799",
+            None,
+            "https://shop.example/5090",
+        )
+        (memory,) = store.recall("shop sells")
+        assert (memory.anchor, memory.to_dict()["link"]) == (None, "https://shop.example/5090")
+
+
+def test_recall_follows_an_edit_of_a_remembered_findings_words(tmp_path):
+    path = tmp_path / "scout.db"
+    old = sqlite3.connect(path)
+    for number, script in enumerate(_MIGRATIONS[:9], start=1):
+        old.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
+    old.close()
+    with Store(path) as store:  # upgraded
+        store.add_run(RESULT)
+        assert [m.claim for m in store.recall("sells")] == ["Shop sells it for $1,999"]
+        edit = sqlite3.connect(path)
+        with edit:
+            edit.execute(
+                "UPDATE knowledge SET claim = 'The card costs two thousand dollars', "
+                "quote = 'Two thousand dollars at the store.', goal = 'graphics card cost'"
+            )
+        edit.close()
+
+        (memory,) = store.recall("thousand dollars")
+        assert (memory.claim, memory.quote, memory.goal) == (
+            "The card costs two thousand dollars",
+            "Two thousand dollars at the store.",
+            "graphics card cost",
+        )
+        assert store.recall("graphics") == [memory]
+        assert store.recall("sells") == []  # the old words are out of the index
+        assert store.recall("cheapest rtx today") == []
+
+
+def test_a_watch_removed_keeps_its_runs_in_the_history_but_no_longer_as_its_own(tmp_path):
+    page = Document(
+        url="https://shop.example/5090",
+        status=FetchStatus.OK,
+        fetched_at=NOW,
+        text="Now $1,999 at Shop.",
+        content_hash="v1",
+    )
+    shop, tracker = RESULT.sources
+    # Started now: the readings of the last 90 days are kept.
+    read = replace(RESULT, started_at=utcnow(), sources=(replace(shop, content_hash="v1"), tracker))
+    with Store(tmp_path / "scout.db") as store:
+        store.put_page(page)
+        before, _ = store.record("gpu", read, [Delta(Change.NEW, price("1999"))])
+        other, _ = store.record("cpu", read, [])
+        store.forget("gpu")
+
+        assert (store.last_runs("gpu"), store.last_readings("gpu", [page.url])) == ([], {})
+        assert [run.id for run in store.recent_runs(watch="gpu")] == [before]
+        assert [run_id for run_id, _ in store.last_runs("cpu")] == [other]
+        assert store.last_readings("cpu", [page.url]) == {page.url: page}
+
+        after, _ = store.record("gpu", run_at(NOW + timedelta(hours=1)), [])
+        assert [run_id for run_id, _ in store.last_runs("gpu", limit=5)] == [after]
+        store.forget("gpu")
+        assert store.last_runs("gpu") == []
+
+        store.forget("new")  # a watch removed before it ever ran
+        first, _ = store.record("new", run_at(NOW), [])
+        assert [run_id for run_id, _ in store.last_runs("new")] == [first]
+
+
+def test_an_alert_links_to_its_quote_unless_the_quote_left_its_page():
+    placed = replace(price("1799"), anchor="text=Now%20%241799.")
+    with Store(":memory:") as store:
+        arrived = [Delta(Change.NEW, placed)]
+        fired = triggers([parse_rule("new")], arrived, baseline=False)
+        store.record("gpu", run_at(NOW), arrived, raised=fired)
+        assert store.facts("gpu")[0].anchor == placed.anchor  # kept for the next run
+
+        left = [Delta(Change.GONE, placed)]
+        fired = triggers([parse_rule("changed")], left, baseline=False)
+        store.record("gpu", run_at(NOW + timedelta(hours=1)), left, raised=fired)
+        gone, new = store.alerts("gpu")
+        assert new.link == "https://shop.example/5090#:~:text=Now%20%241799."
+        assert (gone.anchor, gone.link) == (None, "https://shop.example/5090")
+
+
+def test_memory_links_to_where_the_newest_reading_found_each_quote():
+    first = replace(RESULT.findings[0], anchor="text=Now%20%241%2C999")
+    newer = replace(first, anchor="text=Now%20%241%2C999%20at%20Shop.")
+
+    def seen(finding, days):
+        return replace(RESULT, started_at=NOW + timedelta(days=days), findings=(finding,))
+
+    with Store(":memory:") as store:
+        store.add_run(seen(first, 0))
+        (memory,) = store.recall("shop sells")
+        assert memory.to_dict()["link"] == "https://shop.example/5090#:~:text=Now%20%241%2C999"
+        store.add_run(seen(newer, 1))
+        assert store.recall("shop sells")[0].anchor == newer.anchor
+        # A reading that could not place it, or an older run resumed late, changes nothing.
+        store.add_run(seen(replace(first, anchor=None), 2))
+        store.add_run(seen(first, 0))
+        assert store.recall("shop sells")[0].anchor == newer.anchor
 
 
 def test_a_fact_check_remembers_what_pages_state_and_leaves_site_tallies_alone():

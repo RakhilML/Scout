@@ -1,10 +1,13 @@
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
+from urllib.parse import unquote
 
+from scout.research import verify as verifying
 from scout.research.results import Finding, Flag, Source, Verdict
 from scout.research.schema import ModelFinding
-from scout.research.verify import assess, locate, numbers, quoted_in, verify
+from scout.research.verify import assess, locate, numbers, quoted_in, span_of, verify
+from scout.textutil import fold
 from scout.web.extract import Offer
 
 TODAY = date(2026, 9, 25)
@@ -102,6 +105,7 @@ def test_invented_quote_is_rejected():
     )
     assert result.verdict is Verdict.UNVERIFIED
     assert result.note == "quote not found in the source"
+    assert result.anchor is None
 
 
 def test_claim_numbers_must_appear_in_the_quote():
@@ -111,6 +115,8 @@ def test_claim_numbers_must_appear_in_the_quote():
     )
     assert result.verdict is Verdict.UNVERIFIED
     assert "1799" in result.note
+    # The quote is on the page: whoever judges it can be shown where.
+    assert result.anchor == "text=sells%20for%20%241%2C999.00%20today."
 
 
 def test_number_formats_are_normalized_and_title_numbers_count():
@@ -302,6 +308,7 @@ def test_quotes_of_published_price_lines_count_as_the_source():
         [shop],
     )
     assert result.verdict is Verdict.VERIFIED
+    assert result.anchor is None  # Scout wrote the line: the page has no such text
 
 
 def test_numbers_glued_to_table_cells_are_still_read():
@@ -342,9 +349,88 @@ def test_a_quote_from_a_search_snippet_says_so():
     (finding,) = verify([claim], [snippet])
     assert finding.verdict is Verdict.VERIFIED
     assert finding.note == "quoted from the search result: the page itself could not be read"
+    assert finding.anchor is None  # a snippet is not the page
+
+
+def test_a_quote_is_placed_on_its_page_in_the_pages_own_characters():
+    said = "Python\N{RIGHT SINGLE QUOTATION MARK}s JIT \N{EM DASH} off by default."
+    page = replace(DOCS, text=f"Notes. {said} More notes.")
+    typed, shouted = verify(
+        [
+            finding("The JIT is off by default", "Python's JIT - off by default"),
+            finding("The JIT is off by default", "PYTHON'S JIT - OFF BY DEFAULT."),
+        ],
+        [page],
+    )
+    assert typed.verdict is Verdict.VERIFIED
+    assert typed.anchor == "text=Python%E2%80%99s%20JIT%20%E2%80%94%20off%20by%20default."
+    assert unquote(typed.anchor) == f"text={said}"
+    assert shouted.anchor == typed.anchor
+
+
+def test_a_near_or_partial_quote_is_placed_on_the_whole_words_it_matched():
+    dropped = (  # "a new interactive interpreter" on the page
+        "The biggest changes include a interactive interpreter, experimental support for "
+        "running in a free threaded mode (PEP 703)"
+    )
+    (near,) = verify([finding("3.13 adds a free-threaded mode (PEP 703)", dropped)], [DOCS])
+    start, end = (unquote(term) for term in near.anchor.removeprefix("text=").split(","))
+    assert start.startswith("The biggest changes")  # the first word, though the match missed it
+    assert end == "free-threaded mode (PEP 703),"
+
+    (cut,) = verify([finding("It sells for $1,999", "ells for $1,999.00 tod", source=2)], [SHOP])
+    assert cut.anchor == "text=sells%20for%20%241%2C999.00%20today."
+
+
+def test_quotes_are_placed_where_locate_finds_them_and_each_page_is_read_for_it_once(
+    monkeypatch,
+):
+    lines = [
+        f"Item {n}\N{EN DASH}its \N{LEFT DOUBLE QUOTATION MARK}weight"
+        f"\N{RIGHT DOUBLE QUOTATION MARK} is {n * 7} kg."
+        for n in range(3000)
+    ]
+    text = "\n".join(lines)
+    for n in (5, 1234, 2999):
+        quote = fold(f'Item {n}-its "weight" is {n * 7} KG')
+        start, end = locate(fold(text), quote)
+        placed = span_of(text, quote)
+        assert text[slice(*placed)] == lines[n]
+        assert fold(text)[start:end] in fold(text[slice(*placed)])
+
+    mapped, of = [], verifying.Words.of
+    monkeypatch.setattr(verifying.Words, "of", lambda text: mapped.append(text) or of(text))
+    page = replace(DOCS, text=text)
+    found = [finding(f"Item {n} weighs {n * 7} kg", lines[n]) for n in (10, 20)]
+    assert all(result.anchor for result in verify(found, [page]))
+    assert len(mapped) == 1  # and none kept once the call is done
 
 
 def test_m_and_b_are_millions_only_after_a_currency_sign_and_small_numbers_may_be_words():
     assert numbers("The tower is 330 m tall; the deal was $330m.") == {"330", "330000000"}
     assert numbers("Mars has two moons.", min_digits=1) == {"2"}
+
+
+def test_a_version_is_one_number():
+    released = "Python 3.13.0 was released on October 7, 2023."
+    assert numbers(released, min_digits=1) == {"3.13", "7", "2023"}  # 3.13.0 is 3.13
+    assert numbers("Upgrade from 1.2.3 to v2.0.0, not 10.0.0.1.", min_digits=1) == {
+        "1.2.3",
+        "2",
+        "10.0.0.1",
+    }
+    assert numbers("Upgrade to v2.0.0.") == set()  # a lone digit, as research reads numbers
     assert numbers("Mars has two moons.") == set()  # research compares numbers of 2+ digits
+
+
+def test_a_quote_in_text_without_spaces_is_placed_to_the_character():
+    version, year, released = (
+        "\N{CJK UNIFIED IDEOGRAPH-7248}\N{CJK UNIFIED IDEOGRAPH-672C}",
+        "\N{CJK UNIFIED IDEOGRAPH-5E74}",
+        "\N{CJK UNIFIED IDEOGRAPH-53D1}\N{CJK UNIFIED IDEOGRAPH-5E03}",
+    )
+    sentence = f"3.13{version}2024{year}10{released}"
+    filler = "\N{CJK UNIFIED IDEOGRAPH-4E00}" * 200
+    page = replace(DOCS, text=f"{filler}{sentence}{filler}")
+    (found,) = verify([finding("3.13 came out in 2024", sentence)], [page])
+    assert unquote(found.anchor) == f"text={sentence}"  # not the whole paragraph

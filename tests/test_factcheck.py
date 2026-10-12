@@ -6,12 +6,14 @@ from pathlib import Path
 import pytest
 
 from scout.errors import AnswerPending, ContextOverflow, LLMUnavailable, ScoutError
+from scout.report import save
 from scout.research.factcheck import (
     NO_CLAIMS,
     Weighed,
     anchored,
     annotate,
     assemble,
+    carried,
     caveat,
     sentences,
     summarize,
@@ -246,6 +248,8 @@ def test_only_quotes_on_the_page_that_state_the_claim_count_as_evidence():
         ("Python 3.13 came out on October 7, 2024.", Verdict.VERIFIED, None),
         ("Python 3.13 came out in 2025.", Verdict.UNVERIFIED, "the quote does not contain 2025"),
     ]
+    placed = "text=Python%203.13.0%20was%20released%20on%20October%207%2C%202024."
+    assert [f.anchor for f in (*supports, *refutes)] == [placed, None, placed, placed]
 
 
 def test_a_confirming_quote_states_every_number_of_the_claim_itself():
@@ -447,6 +451,32 @@ def test_a_check_rules_on_each_claim_from_the_quotes_it_verified():
     ) in result.warnings
 
 
+def test_a_saved_check_links_each_quote_to_where_it_is_on_its_page(tmp_path):
+    backend = ScriptedBackend({"claims": [CLAIMS], "judge": [JUDGE_RELEASE, JUDGE_GIL, JUDGE_JIT]})
+    markdown, data, page = save(checker(backend).check(TEXT), tmp_path)
+
+    findings = json.loads(data.read_text(encoding="utf-8"))["findings"]
+    assert [finding["anchor"] is not None for finding in findings] == [
+        True,  # refutes: on its page
+        True,  # confirms
+        True,  # confirms
+        True,  # set aside, but on its page: the quote does not contain 2023
+        False,  # set aside: not on its page
+    ]
+    assert (
+        findings[2]["anchor"] == "text=Python%203.13%20ships%20an%20experimental%20JIT%20compiler"
+    )
+    text = markdown.read_text(encoding="utf-8")
+    claims, sources = text.split("## Sources")
+    deciding = [line for line in claims.splitlines() if "- confirms" in line or "- refutes" in line]
+    assert len(deciding) == 3
+    assert all("#:~:text=" in line for line in deciding)
+    assert "#:~:" not in sources
+    cards, table = page.read_text(encoding="utf-8").split("<h2>Sources</h2>")
+    assert cards.count("#:~:text=") == 4
+    assert "#:~:" not in table
+
+
 def test_a_web_page_is_checked_against_other_sites_only():
     sister, own, own_jit = (
         "https://news.blog.example/release",
@@ -624,6 +654,57 @@ def test_an_unusable_judgment_leaves_its_claim_unclear_but_a_model_that_is_down_
             checker(stopped).check(TEXT)
 
 
+def test_a_check_reusing_an_earlier_one_checks_the_same_claims_and_keeps_unchanged_evidence():
+    aside = evidence("supports", "Python 3.13 makes every program twice as fast.", 2)
+    judge_jit = {**JUDGE_JIT, "evidence": [*JUDGE_JIT["evidence"], aside]}
+    backend = ScriptedBackend({"claims": [TWO_CLAIMS], "judge": [JUDGE_RELEASE, judge_jit]})
+    first = checker(backend).check(TEXT)
+    released, jit = first.claims
+    assert (released.pages, jit.pages, jit.set_aside) == ((1, 2), (2, 3), (5,))
+
+    # The release page changed, and its claim now reads the pages in another order first.
+    pages = {**PAGES, RELEASE: f"{PAGES[RELEASE]} Download it now."}
+    search = FakeSearch(
+        {**SEARCH, "python 3.13 release date": SEARCH["python 3.13 release date"][::-1]}
+    )
+    refuting = evidence("refutes", "Python 3.13.0 was released on October 7, 2024.", 2)
+    backend = ScriptedBackend({"judge": [{"evidence": [refuting], "note": ""}]})
+    again = checker(backend, search=search, fetcher=FakeFetcher(pages)).check(TEXT, reuse=first)
+
+    assert backend.purposes() == ["judge"]
+    assert [s.url for s in again.sources] == [WHATSNEW, RELEASE, REALPY]
+    rejudged, kept = again.claims
+    assert (rejudged.ruling, rejudged.pages) == (Ruling.REFUTED, (1, 2))
+    assert (kept.ruling, kept.note, kept.pages) == (Ruling.SUPPORTED, jit.note, (1, 3))
+    evidence_now = [again.numbered[n - 1] for n in (*kept.supports, *kept.set_aside)]
+    evidence_then = [first.numbered[n - 1] for n in (*jit.supports, *jit.set_aside)]
+    assert [f.quote for f in evidence_now] == [f.quote for f in evidence_then]
+    assert [f.source for f in evidence_now] == [1, 3, 1]  # WHATSNEW, REALPY, WHATSNEW
+    assert evidence_now[2].note == "quote not found in the source"
+    assert "claim 2: no page changed since the last check; its evidence was kept" in again.warnings
+    assert not again.carried_over  # one claim was judged
+
+    same = checker(ScriptedBackend({})).check(TEXT, reuse=first)
+    assert same.carried_over
+    assert [c.ruling for c in same.claims] == [Ruling.REFUTED, Ruling.SUPPORTED]
+
+
+def test_evidence_citing_a_page_outside_the_claim_is_judged_again():
+    refuted, supported = CHECK_RESULT.claims
+    jit = ClaimToCheck(claim=supported.claim, excerpt=supported.excerpt, query=supported.query)
+    pages = [replace(CHECK_RESULT.source(n), index=n + 4) for n in (2, 3)]
+    before = replace(CHECK_RESULT, claims=(refuted, replace(supported, pages=(2, 3))))
+    kept = carried(jit, before, pages)
+    assert [f.source for f in kept.supports] == [6, 7]
+    assert (kept.note, kept.pages, kept.kept) == (supported.note, (6, 7), True)
+
+    narrower = replace(CHECK_RESULT, claims=(refuted, replace(supported, pages=(2,))))
+    assert carried(jit, narrower, pages[:1]) is None  # it quotes source 3 as well
+    assert carried(jit, before, pages[::-1]) is None  # read in another order
+    assert carried(jit, before, []) is None
+    assert carried(jit, CHECK_RESULT, pages) is None  # an older check: its pages are unknown
+
+
 def test_sources_too_long_for_the_context_window_are_sent_again_shorter():
     detail = " ".join(f"Python 3.13 detail {n} is documented in full here." for n in range(80))
     pages = {**PAGES, REALPY: f"{PAGES[REALPY]} {detail}"}
@@ -729,16 +810,19 @@ def test_a_text_without_checkable_claims_searches_nothing():
 
 def test_a_check_round_trips_through_json_and_older_runs_still_load():
     refuted, supported = CHECK_RESULT.claims
-    checked = replace(CHECK_RESULT, claims=(replace(refuted, unchecked=("2024",)), supported))
+    checked = replace(
+        CHECK_RESULT, claims=(replace(refuted, unchecked=("2024",), pages=(1, 2)), supported)
+    )
     data = json.loads(json.dumps(checked.to_dict()))
     assert [c["ruling"] for c in data["claims"]] == ["refuted", "supported"]
     assert data["claims"][0]["unchecked"] == ["2024"]
+    assert data["claims"][0]["pages"] == [1, 2]
     assert data["checked_text"] == CHECK_RESULT.checked_text
     assert RunResult.from_dict(data) == checked
 
-    del data["claims"][0]["unchecked"], data["checked_text"]
+    del data["claims"][0]["unchecked"], data["claims"][0]["pages"], data["checked_text"]
     older = RunResult.from_dict(data)
-    assert (older.claims[0].unchecked, older.checked_text) == ((), "")
+    assert (older.claims[0].unchecked, older.claims[0].pages, older.checked_text) == ((), (), "")
     del data["claims"]
     assert RunResult.from_dict(data).claims == ()
 
@@ -974,6 +1058,30 @@ def test_a_claims_card_gives_only_the_reasons_it_has_no_evidence():
     result = checker(backend, search=search, fetcher=fetcher).check(ARTICLE)
     assert any("left out 1 search result(s)" in warning for warning in result.warnings)
     assert result.claims[0].problems == ()  # pages were read; they just settle nothing
+
+
+def test_a_citation_marker_the_model_carries_into_a_claim_is_no_number_of_it():
+    text = "The bridge opened in 2021 [3]. It cost 40 million euros [4][5]."
+    listed = [
+        ClaimToCheck(claim="The bridge opened in 2021 [3].", excerpt=text[:30], query="q"),
+        ClaimToCheck(
+            claim="The bridge cost 40 million euros [4][5].",
+            excerpt="It cost 40 million euros [4][5].",
+            query="q",
+        ),
+    ]
+    claims, warnings = anchored(listed, text, 5)
+    assert [c.claim for c in claims] == [
+        "The bridge opened in 2021.",
+        "The bridge cost 40 million euros.",
+    ]
+    assert warnings == []
+
+
+def test_a_passage_copied_without_its_sentences_markers_still_marks_the_sentence():
+    text = "Python 3.13 was released on October 7, 2024 [1][2]. It is fast."
+    released = ClaimCheck(RELEASED, "Python 3.13 was released on October 7, 2024.", "q")
+    assert [held for _, held in annotate(text, [released])] == [(1,), ()]
 
 
 def test_a_passage_never_cuts_a_word_or_a_number():

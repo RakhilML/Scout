@@ -32,6 +32,7 @@ from rapidfuzz import fuzz
 from scout.research.results import Finding, RunResult, Source
 from scout.research.verify import evidence, numbers, quoted_in
 from scout.textutil import fold
+from scout.web import fragments
 from scout.web.domains import hostname
 from scout.web.extract import Offer
 
@@ -60,10 +61,18 @@ class Fact:
     unit: str | None = None
     structured: bool = False  # read from the page's schema.org data, not from its text
     availability: str | None = None  # of a structured offer, a schema.org term ("InStock")
+    noticed: bool = False  # a claim watch's evidence no page proves new: shown, never ruled on
+    missed: bool = False  # a claim watch's evidence its page lacked once: one more and it leaves
+    anchor: str | None = None  # where its quote is on its page, as last read (Finding.anchor)
 
     @property
     def site(self) -> str:
         return hostname(self.url)
+
+    @property
+    def link(self) -> str:
+        """Its page, opening at its quote."""
+        return fragments.link(self.url, self.anchor)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,6 +88,9 @@ class Fact:
             "unit": self.unit,
             "structured": self.structured,
             "availability": self.availability,
+            "noticed": self.noticed,
+            "missed": self.missed,
+            "anchor": self.anchor,
         }
 
     @classmethod
@@ -96,6 +108,9 @@ class Fact:
             unit=data.get("unit"),
             structured=data.get("structured", False),
             availability=data.get("availability"),
+            noticed=data.get("noticed", False),
+            missed=data.get("missed", False),
+            anchor=data.get("anchor"),
         )
 
 
@@ -103,7 +118,7 @@ class Fact:
 class Delta:
     change: Change
     fact: Fact  # the fact as it is now (as it was, for GONE)
-    previous: Fact | None = None  # the remembered fact, for CHANGED and SAME
+    previous: Fact | None = None  # the remembered fact, for CHANGED, SAME and a NOTICED ruling
 
     @property
     def percent(self) -> Decimal | None:
@@ -128,7 +143,10 @@ def facts_from(result: RunResult) -> list[Fact]:
 
 
 def diff(
-    previous: Sequence[Fact], result: RunResult, *, earlier: Mapping[str, Source] | None = None
+    previous: Sequence[Fact],
+    result: RunResult,
+    *,
+    earlier: Mapping[str, Source] | None = None,
 ) -> list[Delta]:
     """Compare a run, as it just happened (with its pages' text), with the remembered facts.
 
@@ -241,6 +259,7 @@ def _fact(finding: Finding, source: Source, seen: datetime) -> Fact:
         unit=finding.unit,
         structured=finding.origin == "structured-data",
         availability=finding.availability,
+        anchor=finding.anchor,
     )
 
 

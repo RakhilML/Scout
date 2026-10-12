@@ -24,7 +24,8 @@ _T = TypeVar("_T")
 @dataclass(frozen=True, slots=True)
 class Settings:
     # Language model. `llm` picks the backend: "openai" (any OpenAI-compatible server such as
-    # LM Studio or Ollama, configured by the LM_STUDIO_* variables), "exchange:DIR" or "replay:DIR".
+    # LM Studio or Ollama, configured by the LM_STUDIO_* variables), "exchange:DIR", "record:DIR"
+    # or "replay:DIR".
     llm: str = "openai"
     llm_base_url: str = DEFAULT_LLM_BASE_URL
     llm_model: str = ""
@@ -43,6 +44,7 @@ class Settings:
     fetch_retries: int = 1
     user_agent: str = DEFAULT_USER_AGENT
     region: str = "us-en"
+    archive: str = "wayback"  # where copies of dead cited pages are looked up, or "off"
 
     # Storage.
     data_dir: Path = Path.home() / ".scout"
@@ -120,6 +122,7 @@ def load_settings(
         region=get("SCOUT_REGION", str, "us-en"),
         search=get("SCOUT_SEARCH", str, "ddgs"),
         render=get("SCOUT_RENDER", str, ""),
+        archive=get("SCOUT_ARCHIVE", str, "wayback"),
         data_dir=data_dir,
         reports_dir=path("SCOUT_OUTPUT_DIR", data_dir / "reports"),
         env_file=env_file,

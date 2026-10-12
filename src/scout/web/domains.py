@@ -31,6 +31,25 @@ DEFAULT_SKIP_DOMAINS = frozenset(
 # Second-level labels under which country domains register names: bbc.co.uk, abc.net.au.
 _SECOND_LEVELS = frozenset({"ac", "co", "com", "edu", "gov", "net", "or", "org"})
 
+# Platforms whose subdomains are other people's sites: someone.substack.com is not substack.com.
+_HOSTED = frozenset(
+    {
+        "blogspot.com",
+        "github.io",
+        "gitlab.io",
+        "hashnode.dev",
+        "medium.com",
+        "neocities.org",
+        "netlify.app",
+        "pages.dev",
+        "readthedocs.io",
+        "substack.com",
+        "tumblr.com",
+        "vercel.app",
+        "wordpress.com",
+    }
+)
+
 # Query parameters that only track clicks; dropping them lets duplicate results collapse.
 _TRACKING_PARAMS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid", "msclkid", "yclid"})
 
@@ -61,14 +80,15 @@ def registrable_domain(host: str) -> str:
     peps.python.org are python.org, news.bbc.co.uk is bbc.co.uk. An IP address stays as it is.
 
     An approximation: Scout ships no public-suffix list, so a country domain counts as a suffix
-    only after one of the common second levels (co.uk, com.au), and all of user.github.io is
-    github.io.
+    only after one of the common second levels (co.uk, com.au), and only the common hosting
+    platforms (substack.com, github.io) keep their users' sites apart.
     """
     if _is_address(host):
         return host
     labels = host.split(".")
     country = len(labels[-1]) == 2 and len(labels) > 2 and labels[-2] in _SECOND_LEVELS
-    return ".".join(labels[-3:] if country else labels[-2:])
+    kept = 3 if country or ".".join(labels[-2:]) in _HOSTED else 2
+    return ".".join(labels[-kept:])
 
 
 def private_address(url: str) -> str | None:
