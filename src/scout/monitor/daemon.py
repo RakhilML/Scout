@@ -55,6 +55,9 @@ class Daemon:
         # waiting for that run) would deadlock: retries are added only before stopping starts.
         self._stopping = False
         self._retry_lock = threading.Lock()
+        # The run each watch's job is planned from (None: it had none): once a removal of the
+        # watch forgets that run, the job waits on a run the watch no longer has.
+        self._planned_from: dict[str, int | None] = {}
 
     @property
     def scheduled(self) -> set[str]:
@@ -96,9 +99,10 @@ class Daemon:
             for job in (name, f"{name}:retry"):
                 if self._scheduler.get_job(job) is not None:
                     self._scheduler.remove_job(job)
+            self._planned_from.pop(name, None)
             log.info("unscheduled %s", name)
         for name, watch in active.items():
-            if self._scheduled.get(name) != watch:
+            if self._scheduled.get(name) != watch or self._late(watch):
                 self._schedule(watch)
         self._scheduled = active
 
@@ -114,7 +118,13 @@ class Daemon:
             watch = self._book.get(name)
             if watch.paused:  # paused after this run was handed to the worker
                 return
-            outcome = run_watch(self._app, watch, notifier=notifier_for(watch), book=self._book)
+            outcome = run_watch(
+                self._app,
+                watch,
+                notifier=notifier_for(watch),
+                book=self._book,
+                listed_in=self._book,
+            )
         except ConfigError as exc:
             log.error("%s failed: %s", name, exc)
         except AnswerPending as exc:
@@ -127,6 +137,7 @@ class Daemon:
             log.exception("%s failed unexpectedly", name)
         else:
             self._cancel_retry(name)
+            self._planned_from[name] = outcome.run_id  # its job's next run follows this one
             changes = ", ".join(f"{n} {c.value}" for c, n in outcome.counts.items()) or "no facts"
             log.info(
                 "%s: run %d, %s, %d alert(s)", name, outcome.run_id, changes, len(outcome.alerts)
@@ -159,6 +170,8 @@ class Daemon:
         due = self._due(watch)
         if due is not None:
             options["next_run_time"] = due
+        last = self._app.store.latest_run(watch.name)
+        self._planned_from[watch.name] = last.id if last is not None else None
         self._scheduler.add_job(
             self.run,
             trigger(watch),
@@ -169,15 +182,23 @@ class Daemon:
         )
         log.info("scheduled %s (%s)", watch.name, watch.every or watch.cron)
 
+    def _late(self, watch: Watch) -> bool:
+        """The run the watch's job is planned from was forgotten since: the watch was removed
+        and added again unchanged, and is due at once. A run that failed, or that waits for
+        the worker, leaves the job planned from the same run: its retry and interval stand."""
+        planned_from = self._planned_from.get(watch.name)
+        return planned_from is not None and self._app.store.forgot(watch.name, planned_from)
+
     def _due(self, watch: Watch) -> datetime | None:
         """When an interval watch is next due: its interval after its last run, or now if that
-        has passed. Cron watches follow their calendar (None)."""
+        has passed or it has none (a watch added again counts none from before its removal).
+        Cron watches follow their calendar (None)."""
         schedule = trigger(watch)
         if not isinstance(schedule, IntervalTrigger):
             return None
         now = self._clock()
-        last = self._app.store.recent_runs(limit=1, watch=watch.name)
-        if not last:
+        last = self._app.store.latest_run(watch.name)
+        if last is None:
             return now
         interval: timedelta = schedule.interval
-        return max(now, last[0].started_at + interval)
+        return max(now, last.started_at + interval)

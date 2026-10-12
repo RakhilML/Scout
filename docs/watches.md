@@ -64,7 +64,7 @@ NAME has 1 to 40 lowercase letters, digits and dashes. It starts with a letter o
 |---|---|---|
 | `--every TEXT` | `1d` | How often the watch runs: `30m`, `6h`, `1d`, `1w`. The shortest interval is 15 minutes. |
 | `--cron TEXT` | | A cron schedule, in place of `--every`: `"0 9 * * *"` is 09:00 every day. |
-| `--alert TEXT` | `new`, `changed` (research watch) | When to alert, for example `"price below 1800 USD"`. Repeat the option for more rules. See [Alert rules](#alert-rules). |
+| `--alert TEXT` | `new`, `changed`; with `--check`: `changed`; with `--cited`: `changed`, `dead` | When to alert, for example `"price below 1800 USD"`. Repeat the option for more rules. See [Alert rules](#alert-rules). |
 | `--notify TEXT` | | Where alerts go: an Apprise URL, for example `ntfy://my-topic`. Repeat the option for more URLs. See [Notifications](#notifications). |
 | `--kind [price\|news\|release\|general]` | the model classifies the goal | Skip the classification of the goal. Not for a claim watch or a citation watch. |
 | `--recency [day\|week\|month\|year\|any]` | | How recent sources must be. Not for a claim watch or a citation watch. |
@@ -291,7 +291,9 @@ What each `scout watch` command shows:
 - `pause NAME`: the daemon stops the runs of the watch. The watch keeps what it knows.
   `resume NAME` starts them again.
 - `remove NAME`: Scout forgets the findings, prices and alerts of the watch. Its runs stay in
-  the history.
+  the history (`scout history`). If you add the watch again, it has no last run, and its first
+  run is a new baseline. Scout does not remove a watch while it runs. If the removal fails, the
+  watch stays in the list: correct the cause and run the command again.
 
 Options of the other commands:
 
@@ -309,7 +311,8 @@ Options of the other commands:
 ### The watches file
 
 Scout keeps the watches in `~/.scout/watches.yaml`. You can edit it by hand. The daemon reads it
-again when it changes. The `scout watch add` command of the [quick start](#quick-start) writes
+again when it changes. On Linux and macOS, only you can read a new watches file (mode 600),
+because notification URLs often hold tokens or passwords. The `scout watch add` command of the [quick start](#quick-start) writes
 this entry:
 
 ```yaml
@@ -338,7 +341,9 @@ watches:
 ### One run at a time
 
 A watch has one run at a time. Scout refuses `scout watch run` while the daemon runs that watch:
-`watch 'gpu' is already running`.
+`watch 'gpu' is already running`. Scout also refuses `scout watch remove` while the watch runs:
+`watch 'gpu' is running: remove it when the run ends`. Scout then changes nothing. Remove the
+watch again when the run ends.
 
 ### Baselines
 
@@ -351,10 +356,9 @@ with`. Some changes start a new baseline:
 - A claim watch starts a new baseline when you edit its text.
 - A citation watch does not start a new baseline when you edit its text. A switch between a web
   address and a text starts one, and so does another web address.
-- A watch removed and added again under the same name forgets what it knew. A citation watch
-  then starts a new baseline. A research watch or a claim watch with the same goal continues
-  from its last run: a finding already on the pages is noticed, not new, and the first rulings
-  of a claim watch do not alert.
+- A watch that you remove and add again under the same name starts a new baseline. This applies
+  to all three kinds of watch. Scout forgets what the old watch knew. The runs of the old watch
+  stay in the history, but the new watch does not compare with them.
 
 ## Claim watches
 
@@ -597,7 +601,8 @@ scout daemon
   error, the daemon keeps its current schedule and writes the problem to its log.
 - It does not run a paused watch.
 - An interval watch is due one interval after its last run, or at once if that time is past. A
-  cron watch follows its calendar.
+  new watch, or a watch that you removed and added again, is due at once. A cron watch follows
+  its calendar.
 - A run missed while the computer slept runs once when the computer wakes.
 - A run that failed for a temporary cause (the model server is down, the search engine limits
   Scout, the exchange backend waits for an answer) runs again after 30 minutes.

@@ -14,7 +14,9 @@ Grammar (case-insensitive):
                                      backed)
     refuted                          a claim's ruling became refuted or disputed (also:
                                      disputed, contradicted)
-    dead                             a cited page could not be read twice in a row (also: dead
+    dead                             a cited page that had been read is gone on every run
+                                     from one at least an hour before; a timeout, a server
+                                     error or a refusal is no news of the page (also: dead
                                      links, unreadable)
 
 A claim watch alerts only on changed, supported and refuted; the last two are its own. A
@@ -263,7 +265,8 @@ def _ruling(rule: Rule, delta: Delta, baseline: bool) -> str | None:
 
 
 def _dead(rule: Rule, delta: Delta, baseline: bool) -> str | None:
-    """A cited page that was read and could not be read again, two runs in a row."""
+    """A cited page that had been read and is now dead: gone on every run from one at least
+    an hour before (claims.pages tells)."""
     fact, was = delta.fact, delta.previous
     if not fact.key.startswith(PAGE) or delta.change is not Change.CHANGED or was is None:
         return None

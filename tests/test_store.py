@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 import responses
 
+from scout.clock import utcnow
 from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.rules import cleared, parse_rule, triggers
 from scout.store import _MIGRATIONS, Store
@@ -273,7 +274,7 @@ def test_alerts_and_memories_kept_before_quotes_were_placed_link_to_their_pages(
     old.commit()
     old.close()
     with Store(path) as store:
-        assert store.schema_version == len(_MIGRATIONS) == 9
+        assert store.schema_version == len(_MIGRATIONS) == 10
         (alert,) = store.alerts("gpu")
         assert (alert.reason, alert.anchor, alert.link) == (
             "new: RTX 5090: $1799",
@@ -282,6 +283,66 @@ def test_alerts_and_memories_kept_before_quotes_were_placed_link_to_their_pages(
         )
         (memory,) = store.recall("shop sells")
         assert (memory.anchor, memory.to_dict()["link"]) == (None, "https://shop.example/5090")
+
+
+def test_recall_follows_an_edit_of_a_remembered_findings_words(tmp_path):
+    path = tmp_path / "scout.db"
+    old = sqlite3.connect(path)
+    for number, script in enumerate(_MIGRATIONS[:9], start=1):
+        old.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
+    old.close()
+    with Store(path) as store:  # upgraded
+        store.add_run(RESULT)
+        assert [m.claim for m in store.recall("sells")] == ["Shop sells it for $1,999"]
+        edit = sqlite3.connect(path)
+        with edit:
+            edit.execute(
+                "UPDATE knowledge SET claim = 'The card costs two thousand dollars', "
+                "quote = 'Two thousand dollars at the store.', goal = 'graphics card cost'"
+            )
+        edit.close()
+
+        (memory,) = store.recall("thousand dollars")
+        assert (memory.claim, memory.quote, memory.goal) == (
+            "The card costs two thousand dollars",
+            "Two thousand dollars at the store.",
+            "graphics card cost",
+        )
+        assert store.recall("graphics") == [memory]
+        assert store.recall("sells") == []  # the old words are out of the index
+        assert store.recall("cheapest rtx today") == []
+
+
+def test_a_watch_removed_keeps_its_runs_in_the_history_but_no_longer_as_its_own(tmp_path):
+    page = Document(
+        url="https://shop.example/5090",
+        status=FetchStatus.OK,
+        fetched_at=NOW,
+        text="Now $1,999 at Shop.",
+        content_hash="v1",
+    )
+    shop, tracker = RESULT.sources
+    # Started now: the readings of the last 90 days are kept.
+    read = replace(RESULT, started_at=utcnow(), sources=(replace(shop, content_hash="v1"), tracker))
+    with Store(tmp_path / "scout.db") as store:
+        store.put_page(page)
+        before, _ = store.record("gpu", read, [Delta(Change.NEW, price("1999"))])
+        other, _ = store.record("cpu", read, [])
+        store.forget("gpu")
+
+        assert (store.last_runs("gpu"), store.last_readings("gpu", [page.url])) == ([], {})
+        assert [run.id for run in store.recent_runs(watch="gpu")] == [before]
+        assert [run_id for run_id, _ in store.last_runs("cpu")] == [other]
+        assert store.last_readings("cpu", [page.url]) == {page.url: page}
+
+        after, _ = store.record("gpu", run_at(NOW + timedelta(hours=1)), [])
+        assert [run_id for run_id, _ in store.last_runs("gpu", limit=5)] == [after]
+        store.forget("gpu")
+        assert store.last_runs("gpu") == []
+
+        store.forget("new")  # a watch removed before it ever ran
+        first, _ = store.record("new", run_at(NOW), [])
+        assert [run_id for run_id, _ in store.last_runs("new")] == [first]
 
 
 def test_an_alert_links_to_its_quote_unless_the_quote_left_its_page():

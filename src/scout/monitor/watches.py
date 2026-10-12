@@ -183,7 +183,7 @@ class WatchBook:
             sort_keys=False,
             allow_unicode=True,
         )
-        write_atomic(self.path, text)
+        write_atomic(self.path, text, mode=0o600)  # notification URLs often hold tokens
 
     def get(self, name: str) -> Watch:
         for watch in self.load():

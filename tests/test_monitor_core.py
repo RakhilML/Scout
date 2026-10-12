@@ -1,4 +1,7 @@
+import os
 import re
+import stat
+import sys
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -524,6 +527,17 @@ def test_watch_book_round_trip_and_editing(tmp_path):
     assert [w.name for w in book.load()] == ["gpu-watch"]
     with pytest.raises(ConfigError, match="no watch named"):
         book.remove("py")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+def test_a_new_watches_file_is_for_its_owner_only(tmp_path):
+    path = tmp_path / "watches.yaml"
+    old = os.umask(0o022)
+    try:
+        WatchBook(path).add(watch(notify=("tgram://bot-token/chat",)))
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # notification URLs hold tokens
 
 
 def test_a_claim_watch_is_marked_in_the_file_and_other_watches_are_not(tmp_path):

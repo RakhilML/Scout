@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 from apscheduler.triggers.interval import IntervalTrigger
@@ -108,20 +109,33 @@ def run_watch(
     *,
     notifier: Notifier | None = None,
     book: WatchBook | None = None,
+    listed_in: WatchBook | None = None,
     public_only: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> WatchRun:
     """Run *watch* once; one run of a watch at a time. Given its *book*, a watch that stops when
-    alerted is paused; *public_only* reads only the public internet (a run an assistant asked
-    for, and every citation watch's: a text may cite anything). *progress* hears of each step of
-    a check."""
-    lock = FileLock(
-        app.settings.data_dir / "locks" / f"{watch.name}.lock",
-        wait=False,
-        busy=f"watch {watch.name!r} is already running",
-    )
-    with lock:
+    alerted is paused. Given *listed_in*, the watches file the caller read *watch* from, the
+    watch is read from it again once the run holds its lock: one removed meanwhile does not run
+    (ConfigError, as for an unknown name), one edited meanwhile runs as it is now.
+    *public_only* reads only the public internet (a run an assistant asked for, and every
+    citation watch's: a text may cite anything). *progress* hears of each step of a check."""
+    with run_lock(app.settings.data_dir, watch.name):
+        if listed_in is not None:
+            current = listed_in.get(watch.name)
+            if current.notify != watch.notify:  # the caller made the notifier for the old URLs
+                notifier = notifier_for(current)
+            watch = current
         return _run(app, watch, notifier, book, public_only or watch.cited, progress)
+
+
+def run_lock(data_dir: Path, name: str, *, busy: str = "") -> FileLock:
+    """The lock a run of the watch *name* holds, taken at once or not at all: while a run
+    holds it, no other run starts and the watch cannot be removed."""
+    return FileLock(
+        data_dir / "locks" / f"{name}.lock",
+        wait=False,
+        busy=busy or f"watch {name!r} is already running",
+    )
 
 
 def _run(
@@ -303,8 +317,10 @@ def remedy(copy: Copy | None) -> str:
 
 def continued(app: App, watch: Watch, last: RunResult) -> RunResult | None:
     """*last*, the watch's last run, when its next run continues from it; else None, and the
-    next run plans again and starts a new baseline. A citation watch removed and added again
-    starts anew too: what it knew is forgotten, though its runs stay."""
+    next run plans again and starts a new baseline. (A watch removed and added again has no
+    last run: the store keeps its runs, but not as the watch's own.) A citation watch whose
+    ledger holds no claim starts anew too: one removed before the store kept removals, or one
+    whose audit kept no claim, has nothing to continue from."""
     if not continues(watch, last):
         return None
     if watch.cited and not any(map(claims.is_ruling, app.store.facts(watch.name))):

@@ -1,7 +1,8 @@
 """Citation watches over several runs of a changing (fake) web and text: a claim keeps its
 evidence while its cited pages read the same, a ruling alerts once when a page changed it, and a
-cited page that stops being readable alerts once, after two runs in a row."""
+cited page that is gone alerts once, when it is still gone at least an hour later."""
 
+import sqlite3
 from dataclasses import replace
 from datetime import timedelta
 from functools import partial
@@ -352,10 +353,29 @@ def test_a_sentence_back_after_one_run_without_it_rules_as_before(world):
 
 def test_a_watch_removed_and_added_again_starts_a_new_baseline(world):
     world.baseline()
+    world.app.store.forget(WATCH.name)  # scout watch remove, then scout watch add
+    again = world.baseline()
+    assert world.last_calls == ["claims", "judge", "judge", "judge"]  # the whole text again
+    assert again.baseline
+    assert world.labels(again) == [("new", "backed")] * 3
+    assert (world.run().baseline, world.last_calls) == (False, [])
+
     world.app.store.forget(WATCH.name)
-    again = world.run(
+    edited = world.run(
         replace(WATCH, goal=text((4, D))), claims=listed((4, 1)), judge=[backed(4, 1)]
     )
+    assert edited.baseline
+
+
+def test_a_watch_removed_before_scout_kept_removals_starts_a_new_baseline(world):
+    world.baseline()
+    world.app.store.forget(WATCH.name)
+    db = sqlite3.connect(world.app.settings.db_path)
+    with db:  # as an older Scout removed it: its ledger is gone, but no mark says so
+        db.execute("DELETE FROM forgotten")
+    db.close()
+    again = world.baseline()
+    assert world.last_calls == ["claims", "judge", "judge", "judge"]
     assert again.baseline
 
 

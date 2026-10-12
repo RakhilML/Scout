@@ -308,6 +308,22 @@ def test_editing_a_claim_watchs_text_starts_a_new_baseline(world):
     assert world.ledger("py-switch") == [("claim", "unclear", "", "")]
 
 
+def test_a_claim_watch_removed_and_added_again_starts_a_new_baseline(world):
+    world.run(claims=LISTED, judge=[SUPPORTED])
+    world.app.store.forget(WATCH.name)  # scout watch remove, then scout watch add
+    again = world.run(claims=LISTED, judge=[SUPPORTED])
+
+    assert world.last_calls == ["claims", "judge"]  # its claims are listed again
+    assert again.baseline
+    assert [(r.change, r.fact.value) for r in again.rulings] == [(Change.NEW, "supported")]
+    assert world.ledger() == [
+        ("claim", "supported", LATEST, DOWNLOADS),
+        ("evidence", "supports", LATEST, DOWNLOADS),
+    ]
+    later = world.run()
+    assert (world.last_calls, later.baseline, later.alerts) == ([], False, ())
+
+
 def test_a_claim_watch_waiting_for_an_answer_resumes_with_the_same_prompts(world):
     world.run(claims=LISTED, judge=[SUPPORTED])
     world.web.pages[DOWNLOADS] = PAGES[DOWNLOADS].replace(LATEST, NEWER)

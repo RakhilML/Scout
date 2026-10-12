@@ -184,6 +184,34 @@ def test_editing_the_goal_plans_again_and_starts_a_new_baseline(world):
     assert reasons(outcome) == ["price below 1900 USD: RTX 5090 Founders Edition: $1,849"]
 
 
+def test_a_watch_removed_and_added_again_starts_a_new_baseline(world):
+    world.run(GPU, extraction(price_at_shop("$1,999"), said(FALLING)))
+    world.run(GPU)
+    world.app.store.forget(GPU.name)  # scout watch remove, then scout watch add
+    world.model.add("plan", PLAN)
+    world.web.pages[SHOP] = shop_page("$1,849")
+    again = world.run(GPU, extraction(price_at_shop("$1,849"), said(FALLING)))
+
+    assert world.last_calls == ["plan", "extract"]
+    assert again.baseline
+    assert again.counts == {Change.NEW: 2}  # as for a new watch: nothing was there before
+    assert reasons(again) == ["price below 1900 USD: RTX 5090 Founders Edition: $1,849"]
+    later = world.run(GPU)
+    assert (world.last_calls, later.baseline, later.counts) == ([], False, {Change.SAME: 2})
+
+
+def test_a_watch_that_found_nothing_trusted_keeps_its_searches_and_tells_what_is_new(world):
+    watch = replace(GPU, alerts=("new",))
+    first = world.run(watch, extraction())
+    assert (first.baseline, world.app.store.facts(watch.name)) == (True, [])
+
+    world.web.pages[SHOP] = shop_page("$1,849")
+    second = world.run(watch, extraction(price_at_shop("$1,849")))
+    assert world.last_calls == ["extract"]  # the plan is reused
+    assert not second.baseline
+    assert reasons(second) == ["new: Shop A sells the RTX 5090 FE for $1,849"]
+
+
 def test_a_watch_that_stops_when_alerted_is_paused(world):
     watch = Watch(
         name="drop",

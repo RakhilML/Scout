@@ -3,6 +3,7 @@ citations are audited, that re-run on a schedule and say what changed."""
 
 from __future__ import annotations
 
+import io
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -15,6 +16,7 @@ from rich.table import Table
 
 from scout.app import App
 from scout.cli._common import KINDS, RECENCY, err, linked, out, settings, when
+from scout.files import write_atomic
 from scout.monitor.claims import (
     PAGE,
     READ,
@@ -28,7 +30,17 @@ from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.feed import FEED_ENTRIES, atom
 from scout.monitor.packs import available
 from scout.monitor.rules import dead_reason
-from scout.monitor.runner import WatchRun, notifier_for, remedy, rules_of, run_watch
+from scout.monitor.runner import (
+    CITED_DEFAULT_RULES,
+    CLAIM_DEFAULT_RULES,
+    DEFAULT_RULES,
+    WatchRun,
+    notifier_for,
+    remedy,
+    rules_of,
+    run_lock,
+    run_watch,
+)
 from scout.monitor.trends import series, sparkline, write_csv
 from scout.monitor.watches import Watch, WatchBook
 from scout.research.factcheck import CITED_LABELS, NOT_JUDGED, UNREADABLE
@@ -55,7 +67,9 @@ def watch_group() -> None:
     "--alert",
     "alerts",
     multiple=True,
-    help='When to alert, e.g. "price below 1800 USD" (repeatable).  [default: new, changed]',
+    help='When to alert, e.g. "price below 1800 USD" (repeatable).  '
+    f"[default: {', '.join(DEFAULT_RULES)}; with --check: {', '.join(CLAIM_DEFAULT_RULES)}; "
+    f"with --cited: {', '.join(CITED_DEFAULT_RULES)}]",
 )
 @click.option(
     "--notify", multiple=True, help="Where alerts go: an Apprise URL, e.g. ntfy://my-topic."
@@ -132,13 +146,12 @@ def list_watches() -> None:
     table = Table("name", "schedule", "alerts", "last run", "state")
     with App(config) as app:
         for watch in watches:
-            runs = app.store.recent_runs(limit=1, watch=watch.name)
-            last = f"{when(runs[0].started_at)} ({runs[0].confidence})" if runs else "never"
+            last = app.store.latest_run(watch.name)
             table.add_row(
                 watch.name,
                 _schedule(watch),
                 escape(", ".join(rules_of(watch))),
-                last,
+                f"{when(last.started_at)} ({last.confidence})" if last else "never",
                 "paused" if watch.paused else "active",
             )
     out.print(table)
@@ -186,10 +199,15 @@ def remove(name: str, yes: bool) -> None:
     book.get(name)  # an unknown name fails before the question
     if not yes:
         click.confirm(f"Remove {name} with its facts, prices and alerts?", abort=True)
-    book.remove(name)
-    with App(config) as app:
-        app.store.forget(name)
-    config.feed_path(name).unlink(missing_ok=True)
+    # Held throughout: a run in progress would record its facts after they are forgotten, and
+    # one that started midway would run a watch half removed. The watch leaves the list last:
+    # if a step fails, it is still listed (with a fresh baseline) and can be removed again.
+    busy = f"watch {name!r} is running: remove it when the run ends"
+    with run_lock(config.data_dir, name, busy=busy):
+        with App(config) as app:
+            app.store.forget(name)
+        config.feed_path(name).unlink(missing_ok=True)
+        book.remove(name)
     out.print(f"Removed {name}.")
 
 
@@ -224,6 +242,7 @@ def run(name: str, llm_spec: str | None) -> None:
             watch,
             notifier=notifier_for(watch),
             book=book,
+            listed_in=book,
             progress=lambda step: status.update(f"{running} {step}"),
         )
     if outcome.is_cited:
@@ -275,8 +294,9 @@ def trend(name: str, csv_path: Path | None) -> None:
         )
     out.print(table)
     if csv_path is not None:
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            write_csv(observations, handle)
+        rows = io.StringIO(newline="")
+        write_csv(observations, rows)
+        write_atomic(csv_path, rows.getvalue())
         out.print(
             f"Wrote {len(observations)} observations to {escape(str(csv_path))}", soft_wrap=True
         )

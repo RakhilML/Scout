@@ -1,20 +1,33 @@
 import io
 import re
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 from click.testing import CliRunner
 from rich.console import Console
 
+from scout.app import App
 from scout.cli import main
 from scout.cli._common import when
+from scout.errors import ConfigError
+from scout.monitor import runner
 from scout.monitor.claims import compare, pages, ruling_keys
 from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.rules import Trigger, parse_rule
-from scout.monitor.runner import WatchRun
+from scout.monitor.runner import WatchRun, run_lock
+from scout.monitor.watches import WatchBook
 from scout.store import Store
-from tests.helpers import AUDIT_RESULT, CHECK_RESULT, GONE, HAS_JIT, NOW, RELEASED_2023
+from tests.helpers import (
+    AUDIT_RESULT,
+    CHECK_RESULT,
+    GONE,
+    HAS_JIT,
+    NOW,
+    RELEASED_2023,
+    FakeResearcher,
+)
 from tests.helpers import SAMPLE_RESULT as RESULT
 
 
@@ -367,6 +380,172 @@ def test_a_citation_watchs_later_run_says_what_it_kept_and_what_moved(workspace,
         f'no longer on docs.python.org: "{was[1].quote}" '
         f'4. New, backed [4]: {ios.claim} "It runs on iOS." (example.org)'
     )
+
+
+@pytest.mark.parametrize(
+    ("goal", "kind", "result"),
+    [
+        ("cheapest RTX 5090", (), replace(RESULT, goal="cheapest RTX 5090")),
+        (CHECK_RESULT.checked_text, ("--check",), CHECK_RESULT),
+        (PSF, ("--cited",), AUDITED),
+    ],
+    ids=["research", "claims", "citations"],
+)
+def test_a_watch_removed_and_added_again_starts_a_new_baseline(
+    workspace, monkeypatch, goal, kind, result
+):
+    monkeypatch.setattr(App, "researcher", lambda self, **options: FakeResearcher(result))
+    first = "first run: this is what later runs are compared with"
+    invoke("watch", "add", "w", goal, *kind)
+    assert first in flat(invoke("watch", "run", "w").output)
+    assert first not in flat(invoke("watch", "run", "w").output)
+
+    assert invoke("watch", "remove", "w", "--yes").exit_code == 0
+    invoke("watch", "add", "w", goal, *kind)
+    assert "never" in invoke("watch", "list").output  # no last run until it runs again
+    assert invoke("history", "--watch", "w").output.count("medium") == 2  # the old runs stay
+    assert first in flat(invoke("watch", "run", "w").output)
+    assert "never" not in invoke("watch", "list").output
+    assert first not in flat(invoke("watch", "run", "w").output)
+
+
+@pytest.mark.parametrize("failing", ["settings", "store"])
+def test_a_remove_that_fails_leaves_the_watch_listed_to_remove_again(
+    workspace, monkeypatch, failing
+):
+    invoke("watch", "add", "gpu", "cheapest RTX 5090")
+    data = workspace / "data"
+    feed = data / "feeds" / "gpu.xml"
+    feed.parent.mkdir(parents=True)
+    feed.write_text("<feed/>", encoding="utf-8")
+    with Store(data / "scout.db") as store:
+        store.record("gpu", RESULT, [])
+
+    def broken(*args, **options):
+        raise ConfigError("SCOUT_ARCHIVE must be off or a URL")
+
+    with monkeypatch.context() as patched:
+        if failing == "settings":  # the App cannot be made
+            patched.setattr("scout.cli.watch.App", broken)
+        else:
+            patched.setattr(Store, "forget", broken)
+        failed = invoke("watch", "remove", "gpu", "--yes")
+    assert failed.exit_code == 1
+    assert "SCOUT_ARCHIVE must be off or a URL" in flat(failed.output)
+    assert [watch.name for watch in WatchBook(data / "watches.yaml").load()] == ["gpu"]
+    assert feed.exists()
+
+    assert invoke("watch", "remove", "gpu", "--yes").exit_code == 0  # once the cause is fixed
+    assert "No watches yet" in invoke("watch", "list").output
+    assert not feed.exists()
+    with Store(data / "scout.db") as store:
+        assert store.last_runs("gpu") == []  # added again, it starts anew
+
+
+def test_a_watch_removed_after_watch_run_read_it_records_nothing(workspace, monkeypatch):
+    monkeypatch.setattr(App, "researcher", lambda self, **options: FakeResearcher(RESULT))
+    invoke("watch", "add", "gpu", RESULT.goal)
+    data = workspace / "data"
+    lock = runner.run_lock
+
+    def removed_first(data_dir, name, **options):  # removed before the run took its lock
+        WatchBook(data / "watches.yaml").remove(name)
+        return lock(data_dir, name, **options)
+
+    monkeypatch.setattr(runner, "run_lock", removed_first)
+    ran = invoke("watch", "run", "gpu")
+    assert ran.exit_code == 1
+    assert "no watch named 'gpu'" in ran.output
+    with Store(data / "scout.db") as store:
+        assert (store.recent_runs(watch="gpu"), store.facts("gpu")) == ([], [])
+    assert not (data / "feeds" / "gpu.xml").exists()
+
+
+def test_a_watch_is_not_removed_while_it_runs(workspace, monkeypatch):
+    invoke("watch", "add", "gpu", "cheapest RTX 5090")
+    feed = workspace / "data" / "feeds" / "gpu.xml"
+    feed.parent.mkdir(parents=True)
+    feed.write_text("<feed/>", encoding="utf-8")
+    price = Fact(
+        key="value|rtx 5090|price|shop.example",
+        claim="RTX 5090 costs $1,999",
+        quote="Now $1,999.",
+        url="https://shop.example/5090",
+        seen=NOW,
+    )
+    with Store(workspace / "data" / "scout.db") as store:
+        store.record("gpu", RESULT, [Delta(Change.NEW, price)])
+
+    with run_lock(workspace / "data", "gpu"):  # a run in progress
+        refused = invoke("watch", "remove", "gpu", "--yes")
+    assert refused.exit_code == 1
+    assert "watch 'gpu' is running: remove it when the run ends" in flat(refused.output)
+    assert [watch.name for watch in WatchBook(workspace / "data" / "watches.yaml").load()] == [
+        "gpu"
+    ]
+    assert feed.exists()
+    with Store(workspace / "data" / "scout.db") as store:
+        assert store.facts("gpu") == [price]
+
+    tried = []  # a run that starts while the watch is removed
+    forget = Store.forget
+
+    def forgetting(self, name):
+        with (
+            pytest.raises(ConfigError, match="'gpu' is already running"),
+            run_lock(workspace / "data", name),
+        ):
+            pass
+        tried.append(name)
+        forget(self, name)
+
+    monkeypatch.setattr(Store, "forget", forgetting)
+    assert invoke("watch", "remove", "gpu", "--yes").exit_code == 0
+    assert tried == ["gpu"]
+    assert not feed.exists()
+    with run_lock(workspace / "data", "gpu"):  # free again
+        pass
+
+
+def test_watch_add_tells_the_default_alert_rules_of_each_kind(workspace):
+    told = flat(invoke("watch", "add", "--help").output)
+    assert "[default: new, changed; with --check: changed; with --cited: changed, dead]" in told
+    assert "[default: new, changed]" not in told
+
+
+def test_a_trend_csv_is_written_whole_with_the_same_rows(workspace, monkeypatch):
+    invoke("watch", "add", "gpu", "cheapest RTX 5090")
+    with Store(workspace / "data" / "scout.db") as store:
+        for hours, amount in enumerate(("1999", "1849")):
+            fact = Fact(
+                key="value|rtx 5090|price|shop.example",
+                claim="RTX 5090 costs money",
+                quote=f"Now ${amount}.",
+                url="https://shop.example/5090",
+                seen=NOW,
+                entity="RTX 5090",
+                value=f"${amount}",
+                amount=Decimal(amount),
+                currency="USD",
+            )
+            run = replace(RESULT, started_at=NOW + timedelta(hours=hours))
+            store.record("gpu", run, [Delta(Change.SAME, fact, fact)])
+    target = workspace / "gpu.csv"
+    assert invoke("watch", "trend", "gpu", "--csv", str(target)).exit_code == 0
+    written = target.read_bytes()
+    assert written.count(b"\r\n") == 3  # the header and two rows, as csv writes them
+    assert b"\r\r\n" not in written
+    assert written.startswith(b"observed_at,label,amount,currency,unit,run_id,key\r\n")
+
+    def broken(observations, out):
+        out.write("observed_at,label\r\n")
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr("scout.cli.watch.write_csv", broken)
+    failed = CliRunner().invoke(main, ["watch", "trend", "gpu", "--csv", str(target)])
+    assert isinstance(failed.exception, OSError)
+    assert target.read_bytes() == written  # the earlier file, whole
+    assert list(workspace.glob(".gpu.csv*")) == []
 
 
 def test_a_citation_watch_run_says_when_a_cited_page_failed_once(workspace, monkeypatch):

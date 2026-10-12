@@ -200,11 +200,31 @@ _MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE alerts ADD COLUMN anchor TEXT;
     ALTER TABLE knowledge ADD COLUMN anchor TEXT;
     """,
+    # 10: the last run of each removed watch, so that a watch added again under its name starts
+    # anew while its runs stay in the history; and a search index that follows any edit of a
+    # remembered finding's words
+    """
+    CREATE TABLE forgotten (
+        watch TEXT PRIMARY KEY,
+        last_run INTEGER NOT NULL
+    );
+    CREATE TRIGGER knowledge_changed AFTER UPDATE OF claim, quote, goal ON knowledge BEGIN
+        INSERT INTO knowledge_index (knowledge_index, rowid, claim, quote, goal)
+        VALUES ('delete', old.id, old.claim, old.quote, old.goal);
+        INSERT INTO knowledge_index (rowid, claim, quote, goal)
+        VALUES (new.id, new.claim, new.quote, new.goal);
+    END;
+    """,
 )
 
 
 SEARCH_KEPT = timedelta(days=7)
 PAGES_KEPT = timedelta(days=90)
+# A watch's own runs: those since it was last removed. Run ids only grow, as runs are never
+# deleted; the runs before stay in the history, but the watch forgot them.
+_SINCE_REMOVED = (
+    "runs.id > coalesce((SELECT last_run FROM forgotten WHERE forgotten.watch = runs.scout), 0)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,7 +416,24 @@ class Store:
         return RunResult.from_dict(json.loads(row["result"])) if row else None
 
     def recent_runs(self, *, limit: int = 20, watch: str | None = None) -> list[RunSummary]:
+        """The run history, newest first: with *watch*, all runs under that name, those from
+        before it was last removed included."""
         where, params = ("WHERE scout = ?", (watch,)) if watch else ("", ())
+        return self._summaries(where, params, limit)
+
+    def latest_run(self, watch: str) -> RunSummary | None:
+        """A watch's latest run of its own: None for one added again that has not run since."""
+        found = self._summaries(f"WHERE scout = ? AND {_SINCE_REMOVED}", (watch,), 1)
+        return found[0] if found else None
+
+    def forgot(self, watch: str, run_id: int) -> bool:
+        """Whether run *run_id* of the watch is no longer its own: the watch was removed since."""
+        row = self._one(
+            "SELECT 1 FROM forgotten WHERE watch = ? AND last_run >= ?", (watch, run_id)
+        )
+        return row is not None
+
+    def _summaries(self, where: str, params: Sequence[Any], limit: int) -> list[RunSummary]:
         rows = self._all(
             "SELECT id, scout, goal, started_at, confidence, verified, findings FROM runs "
             f"{where} ORDER BY started_at DESC, id DESC LIMIT ?",
@@ -417,7 +454,8 @@ class Store:
 
     def last_readings(self, watch: str, urls: Collection[str]) -> dict[str, Document]:
         """Each of *urls* as the watch's latest run that read it in full saw it, within the time
-        page versions are kept: one pass over the watch's runs, however many pages."""
+        page versions are kept: one pass over the watch's runs, however many pages. The runs
+        before the watch was last removed are not its own."""
         wanted = set(urls)
         if not wanted:
             return {}
@@ -425,7 +463,7 @@ class Store:
             "SELECT json_extract(source.value, '$.url') AS url,"
             " json_extract(source.value, '$.content_hash') AS hash"
             " FROM runs, json_each(runs.result, '$.sources') AS source"
-            " WHERE runs.scout = ? AND runs.started_at >= ?"
+            f" WHERE runs.scout = ? AND runs.started_at >= ? AND {_SINCE_REMOVED}"
             " AND json_extract(source.value, '$.content_hash') IS NOT NULL"
             " ORDER BY runs.started_at DESC, runs.id DESC",
             (watch, (datetime.now(UTC) - PAGES_KEPT).isoformat()),
@@ -438,9 +476,11 @@ class Store:
         return {url: doc for url, doc in found.items() if doc is not None}
 
     def last_runs(self, watch: str, *, limit: int = 1) -> list[tuple[int, RunResult]]:
-        """A watch's latest runs with their ids, newest first."""
+        """A watch's latest runs with their ids, newest first. The runs before the watch was last
+        removed are not its own: one added again under the name has none to continue from."""
         rows = self._all(
-            "SELECT id, result FROM runs WHERE scout = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+            f"SELECT id, result FROM runs WHERE scout = ? AND {_SINCE_REMOVED}"
+            " ORDER BY started_at DESC, id DESC LIMIT ?",
             (watch, limit),
         )
         return [(row["id"], RunResult.from_dict(json.loads(row["result"]))) for row in rows]
@@ -703,11 +743,18 @@ class Store:
             return removed
 
     def forget(self, watch: str) -> None:
-        """Drop a watch's ledger, history and alerts (its runs stay in the run history)."""
+        """Drop a watch's ledger, history and alerts. Its runs stay in the run history, but are
+        no longer the watch's own (last_runs, last_readings)."""
         with self._transaction() as conn:
             conn.execute("DELETE FROM facts WHERE watch = ?", (watch,))
             conn.execute("DELETE FROM observations WHERE watch = ?", (watch,))
             conn.execute("DELETE FROM alerts WHERE watch = ?", (watch,))
+            conn.execute(
+                "INSERT INTO forgotten (watch, last_run)"
+                " SELECT ?, coalesce(max(id), 0) FROM runs WHERE scout = ?"
+                " ON CONFLICT (watch) DO UPDATE SET last_run = excluded.last_run",
+                (watch, watch),
+            )
 
     def get_capabilities(self, key: str, *, newer_than: datetime) -> dict[str, Any] | None:
         row = self._one("SELECT probed_at, capabilities FROM models WHERE key = ?", (key,))

@@ -10,6 +10,7 @@ import responses
 
 from scout.app import App
 from scout.errors import AnswerPending, SearchError
+from scout.monitor import runner
 from scout.monitor.diff import Change, Delta, Fact
 from scout.monitor.rules import parse_rule, triggers
 from scout.monitor.runner import run_watch
@@ -653,6 +654,55 @@ def test_a_citation_watch_run_gives_a_dead_pages_archived_copy(app, monkeypatch)
     (ran,) = call(app, ("watch_run", {"name": "notes"}))
     (page,) = ran.structured_content["pages"]
     assert (page["archive"], page["archived"]) == ("not looked up", None)
+
+
+def test_a_watch_removed_and_added_again_has_its_first_run_again(app, monkeypatch):
+    monkeypatch.setattr(App, "researcher", lambda self, **options: FakeResearcher(CHECK_RESULT))
+    add = ("watch_add", {"name": "py", "goal": CHECKED_TEXT, "check": True})
+    run = ("watch_run", {"name": "py"})
+    _, first, second = call(app, add, run, run)
+    assert (first.structured_content["first_run"], second.structured_content["first_run"]) == (
+        True,
+        False,
+    )
+    WatchBook(app.settings.watches_path).remove("py")  # as scout watch remove does
+    app.store.forget("py")
+    added, listed, again, relisted = call(app, add, ("watch_list", {}), run, ("watch_list", {}))
+    assert added.structured_content["last_run"] is None
+    assert [watch["last_run"] for watch in listed.structured_content["watches"]] == [None]
+    assert again.structured_content["first_run"]
+    (watch,) = relisted.structured_content["watches"]
+    assert watch["last_run"] == CHECK_RESULT.started_at.isoformat()
+
+    monkeypatch.setattr(App, "researcher", lambda self, **options: FakeResearcher(AUDIT_RESULT))
+    sources = "\n".join(f"[{page.index}] {page.url}" for page in AUDIT_RESULT.sources)
+    cited = ("watch_add", {"name": "notes", "goal": f"{CITED_TEXT}\n\n{sources}", "cited": True})
+    call(app, cited)
+    run_watch(app, WatchBook(app.settings.watches_path).get("notes"))  # from the CLI or daemon
+    (ran,) = call(app, ("watch_run", {"name": "notes"}))
+    assert not ran.is_error
+    WatchBook(app.settings.watches_path).remove("notes")
+    app.store.forget("notes")
+    _, refused = call(app, cited, ("watch_run", {"name": "notes"}))
+    assert refused.is_error
+    assert "citation watch notes has not run yet" in refused.content[0].text
+
+
+def test_a_watch_removed_after_watch_run_read_it_records_nothing(app, monkeypatch):
+    monkeypatch.setattr(App, "researcher", lambda self, **options: FakeResearcher(SAMPLE_RESULT))
+    call(app, ("watch_add", {"name": "gpu", "goal": "cheapest RTX 5090"}))
+    lock = runner.run_lock
+
+    def removed_first(data_dir, name, **options):  # removed before the run took its lock
+        WatchBook(app.settings.watches_path).remove(name)
+        return lock(data_dir, name, **options)
+
+    monkeypatch.setattr(runner, "run_lock", removed_first)
+    (ran,) = call(app, ("watch_run", {"name": "gpu"}))
+    assert ran.is_error
+    assert "no watch named 'gpu'" in ran.content[0].text
+    assert (app.store.recent_runs(watch="gpu"), app.store.facts("gpu")) == ([], [])
+    assert not app.settings.feed_path("gpu").exists()
 
 
 def test_a_quote_a_claim_watch_noticed_links_to_its_place_too(app, monkeypatch):

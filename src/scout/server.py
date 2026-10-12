@@ -166,7 +166,8 @@ def build(app: App) -> MCPServer:
         claim's ruling changes because a page did; rules: changed, supported, refuted.
         With cited, goal is a web address or a text with citations, whose cited sentences are
         checked against the pages they cite on each run; rules: changed, backed,
-        contradicted, dead (a cited page that could not be read twice in a row)."""
+        contradicted, dead (a cited page that had been read is gone on every run from one at
+        least an hour before; a timeout, a server error or a refusal is no news of the page)."""
         with _as_tool_errors():
             watch = Watch(
                 name=name,
@@ -189,14 +190,15 @@ def build(app: App) -> MCPServer:
     def watch_run(name: str) -> dict[str, Any]:
         """Run a watch now: what changed since its last run, and which alerts that raised.
         For a claim watch, "claims" gives each claim's ruling (as page-proven evidence has it)
-        with the quote behind it ("gone": that quote left its page) and the evidence the model
-        newly noticed, which is shown but never alerted on. For a citation watch, "labels"
-        counts its claims' labels, "claims" lists those that are new or changed with the
-        pages they cite, "pages" the cited pages that went dead (with the newest archived copy,
-        and whether it still holds the quote; "archive" says "archived", "not archived", or "not
-        looked up" when the archive did not answer) or came back, and "left" how many claims
-        left the text. A citation watch's first run audits every cited sentence, so it is
-        refused here: run `scout watch run NAME` or let `scout daemon` run it."""
+        with the quote behind it ("gone": that quote left its page) and "noticed": every quote
+        the model noticed, in this run or before, that has not left its page; it is shown but
+        never rules or alerts. For a citation watch, "labels" counts its claims' labels,
+        "claims" lists those that are new or changed with the pages they cite, "pages" the
+        cited pages that went dead (with the newest archived copy, and whether it still holds
+        the quote; "archive" says "archived", "not archived", or "not looked up" when the
+        archive did not answer) or came back, and "left" how many claims left the text. A
+        citation watch's first run audits every cited sentence, so it is refused here: run
+        `scout watch run NAME` or let `scout daemon` run it."""
         with _as_tool_errors():
             watch = book.get(name)
             if watch.cited and not _has_run(app, watch):
@@ -206,7 +208,12 @@ def build(app: App) -> MCPServer:
                     f"`scout watch run {name}` or let `scout daemon` run it"
                 )
             outcome = run_watch(
-                app, watch, notifier=notifier_for(watch), book=book, public_only=True
+                app,
+                watch,
+                notifier=notifier_for(watch),
+                book=book,
+                listed_in=book,
+                public_only=True,
             )
         ran = {
             "run_id": outcome.run_id,
@@ -480,7 +487,7 @@ def _page_state(page: Delta) -> str:
 
 
 def _watch_view(app: App, watch: Watch) -> dict[str, Any]:
-    runs = app.store.recent_runs(limit=1, watch=watch.name)
+    last = app.store.latest_run(watch.name)
     return {
         "name": watch.name,
         "goal": watch.label,
@@ -489,5 +496,5 @@ def _watch_view(app: App, watch: Watch) -> dict[str, Any]:
         "check": watch.check,
         "cited": watch.cited,
         "paused": watch.paused,
-        "last_run": runs[0].started_at.isoformat() if runs else None,
+        "last_run": last.started_at.isoformat() if last else None,
     }

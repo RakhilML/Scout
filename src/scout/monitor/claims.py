@@ -18,7 +18,7 @@ A citation watch audits the citations of a text or a web page. A claim is known 
 the addresses of the pages its sentence cites, so one fact cited to two pages is two claims, and
 renumbered references change nothing. Its ruling reads as a cite-check's label. A claim whose
 sentence left the text leaves quietly, and each cited page is remembered as read or not, so that
-a page that cannot be read two runs in a row can be told.
+a page gone on every run from one at least an hour before can be told dead.
 """
 
 from __future__ import annotations
