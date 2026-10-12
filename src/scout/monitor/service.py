@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scout.errors import ScoutError
+from scout.files import write_atomic
 
 Command = tuple[str, ...]
 _UNIT = "scout.service"
@@ -39,8 +40,7 @@ Runner = Callable[..., object]  # subprocess.run, or a stand-in
 
 def install(service: ServicePlan, *, run: Runner | None = None) -> None:
     for path, text in service.files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8", newline="")
+        write_atomic(path, text)
     _run_all(service.install, run, check=True)
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from scout import __version__
+from scout.files import write_atomic
 from scout.research.deadlinks import (
     CONTRADICTED,
     COPY_UNREADABLE,
@@ -364,8 +365,8 @@ def render_json(result: RunResult, *, run_id: int | None = None) -> str:
 
 def save(result: RunResult, directory: Path, *, run_id: int | None = None) -> list[Path]:
     """Write ``<date>_<time>_<slug>.md`` and ``.json`` and, for a fact-check, the annotated
-    page as ``.html``; returns their paths in that order."""
-    directory.mkdir(parents=True, exist_ok=True)
+    page as ``.html``, each written whole, with LF line ends on every system; returns their
+    paths in that order."""
     stem = f"{result.started_at:%Y-%m-%d_%H%M%S}_{slug(result.goal)}"
     renders = {".md": render_markdown, ".json": render_json}
     if result.plan.kind == CHECK_KIND:
@@ -373,7 +374,7 @@ def save(result: RunResult, directory: Path, *, run_id: int | None = None) -> li
     paths = []
     for suffix, render in renders.items():
         path = directory / f"{stem}{suffix}"
-        path.write_text(render(result, run_id=run_id), encoding="utf-8")
+        write_atomic(path, render(result, run_id=run_id))
         paths.append(path)
     return paths
 

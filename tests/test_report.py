@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -263,6 +264,20 @@ def test_save_writes_the_annotated_page_of_a_fact_check(tmp_path):
     assert [path.suffix for path in paths] == [".md", ".json", ".html"]
     assert '<mark class="refuted"' in paths[2].read_text(encoding="utf-8")
     assert [path.suffix for path in save(RESULT, tmp_path)] == [".md", ".json"]
+
+
+def test_save_writes_each_file_whole_and_byte_for_byte_as_rendered(tmp_path, monkeypatch):
+    paths = save(CHECK_RESULT, tmp_path, run_id=14)
+    for path, render in zip(paths, (render_markdown, render_json, render_html), strict=True):
+        assert path.read_bytes() == render(CHECK_RESULT, run_id=14).encode()  # LF everywhere
+    data = paths[1].read_bytes()
+
+    # A lone surrogate cannot be written as UTF-8: the write fails halfway, as a crash would.
+    monkeypatch.setattr("scout.report.render_json", lambda result, run_id: '{"run_id": "\udc80"}')
+    with pytest.raises(UnicodeEncodeError):
+        save(CHECK_RESULT, tmp_path, run_id=15)
+    assert paths[1].read_bytes() == data
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(path.name for path in paths)
 
 
 def test_a_cite_check_heads_each_claim_with_what_the_pages_it_cites_said():
