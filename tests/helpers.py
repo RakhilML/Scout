@@ -86,6 +86,9 @@ class FakeSearch:
             for rank, (url, title, snippet) in enumerate(rows, start=1)
         ]
 
+    def close(self) -> None:
+        pass
+
 
 class FakeFetcher:
     """Serves prepared Documents (text pages get a content hash, as real ones do); URLs it does

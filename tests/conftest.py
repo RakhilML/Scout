@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from tests.helpers import Clock
+
+
+def pytest_configure(config):
+    """Tables wrap at one width on every machine. Rich takes COLUMNS when the CLI's console is
+    made, at import, so this runs before any test module imports the CLI."""
+    os.environ["COLUMNS"] = "100"
 
 
 @pytest.fixture(autouse=True)
