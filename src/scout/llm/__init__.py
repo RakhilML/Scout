@@ -11,25 +11,30 @@ from scout.llm.openai_compat import OpenAICompatBackend
 from scout.llm.routing import RoutedBackend
 from scout.settings import Settings
 
+_KINDS = ("openai", "exchange", "replay", "record")
+
 
 def make_backend(settings: Settings) -> Backend:
     """Build the backend named by ``SCOUT_LLM``: openai | exchange:DIR | replay:DIR | record:DIR."""
-    kind, _, argument = settings.llm.partition(":")
-    kind = kind.strip().lower()
+    kind = _kind(settings)
     if kind == "openai":
         return _served(settings)
-    if kind in ("exchange", "replay", "record"):
-        if not argument.strip():
-            raise ConfigError(f"SCOUT_LLM={settings.llm!r} needs a folder, e.g. {kind}:./exchange")
-        directory = Path(argument.strip()).expanduser().resolve()
-        if kind == "record":
-            return ExchangeBackend(directory, mode=ExchangeMode.RECORD, inner=_served(settings))
-        mode = ExchangeMode.ANSWER if kind == "exchange" else ExchangeMode.REPLAY
-        return ExchangeBackend(directory, mode=mode)
-    raise ConfigError(
-        f"unknown SCOUT_LLM value {settings.llm!r}: "
-        "use openai, exchange:DIR, replay:DIR or record:DIR"
-    )
+    argument = settings.llm.partition(":")[2].strip()
+    if not argument:
+        raise ConfigError(f"SCOUT_LLM={settings.llm!r} needs a folder, e.g. {kind}:./exchange")
+    directory = Path(argument).expanduser().resolve()
+    if kind == "record":
+        return ExchangeBackend(directory, mode=ExchangeMode.RECORD, inner=_served(settings))
+    mode = ExchangeMode.ANSWER if kind == "exchange" else ExchangeMode.REPLAY
+    return ExchangeBackend(directory, mode=mode)
+
+
+def named_server(settings: Settings) -> OpenAICompatBackend | None:
+    """The model server that ``SCOUT_LLM`` sends requests to (openai, record:DIR), to ask what
+    it offers: that needs no model id. None for a backend that asks no server."""
+    if _kind(settings) not in ("openai", "record"):
+        return None
+    return _server(settings, settings.llm_model)
 
 
 def model_server(backend: Backend) -> OpenAICompatBackend | None:
@@ -37,6 +42,16 @@ def model_server(backend: Backend) -> OpenAICompatBackend | None:
     if isinstance(backend, ExchangeBackend | RoutedBackend):
         return model_server(backend.inner) if backend.inner is not None else None
     return backend if isinstance(backend, OpenAICompatBackend) else None
+
+
+def _kind(settings: Settings) -> str:
+    kind = settings.llm.partition(":")[0].strip().lower()
+    if kind not in _KINDS:
+        raise ConfigError(
+            f"unknown SCOUT_LLM value {settings.llm!r}: "
+            "use openai, exchange:DIR, replay:DIR or record:DIR"
+        )
+    return kind
 
 
 def _served(settings: Settings) -> Backend:
@@ -52,6 +67,10 @@ def _openai(settings: Settings, model: str) -> OpenAICompatBackend:
         raise ConfigError(
             "LM_STUDIO_MODEL is not set; run `scout models` to see what the server offers"
         )
+    return _server(settings, model)
+
+
+def _server(settings: Settings, model: str) -> OpenAICompatBackend:
     return OpenAICompatBackend(
         settings.llm_base_url,
         model,

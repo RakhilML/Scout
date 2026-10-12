@@ -111,12 +111,16 @@ class Researcher:
         pins: Pins | None = None,
         pin_scope: str = "",
         archive: Archive | None = None,
+        today: date | None = None,
     ) -> None:
         self._search_backend = search
         self._fetcher = fetcher
         self._backend = backend
         self._options = options or ResearchOptions()
         self._clock = clock
+        # The day the analysis is for, when it is not the day a run starts: a recorded
+        # session's, so that a replay on a later day asks and judges as the recording did.
+        self._today = today
         self._sites = sites  # what earlier runs learned about sites; None: nothing
         self._pins = pins
         self._pin_scope = pin_scope  # who runs it (a watch): runs of one goal pin apart
@@ -159,14 +163,12 @@ class Researcher:
 
     def _run(self, goal: str, plan: Plan | None, reuse: RunResult | None) -> RunResult:
         started = self._started()
+        today = self._day(started)
         warnings: list[str] = []
-        plan = (
-            self._forced(plan) if plan is not None else self._plan(goal, started.date(), warnings)
-        )
+        plan = self._forced(plan) if plan is not None else self._plan(goal, today, warnings)
         sources = self._read(goal, plan, warnings)
         carried = _carried_sources(reuse.sources, sources) if reuse is not None else None
         if reuse is not None and carried is not None:
-            today = started.date()
             findings = _report_order(_flag_stale(reuse.findings, carried, plan, today))
             return replace(
                 reuse,
@@ -236,6 +238,11 @@ class Researcher:
         started = datetime.fromisoformat(pinned) if pinned else self._clock()
         self._reads["started"] = started.isoformat()
         return started
+
+    def _day(self, started: datetime) -> date:
+        """The day a run that started at *started* is analyzed for: in its prompts, for stale
+        findings and for its confidence."""
+        return self._today or started.date()
 
     def _read(
         self,
@@ -329,7 +336,7 @@ class Researcher:
         ]
         messages = prompts.follow_up_messages(
             result.goal,
-            result.started_at.date(),
+            self._day(result.started_at),
             facts=facts,
             set_aside=set_aside,
             searched=result.plan.queries,
@@ -346,7 +353,7 @@ class Researcher:
             sources = self._read(result.goal, this_round, warnings, exclude=read, start=start)
         except SearchError:
             return None
-        today = result.started_at.date()
+        today = self._day(result.started_at)
         extraction = self._extract(result.goal, this_round, sources, today, warnings)
         found = verify(extraction.findings[:MAX_FINDINGS], sources)
         if result.plan.kind == "price":
@@ -378,7 +385,7 @@ class Researcher:
             prompts.fact_line(number, f, result.source(f.source))
             for number, f in enumerate(result.trusted, start=1)
         ]
-        messages = prompts.answer_messages(result.goal, result.started_at.date(), facts)
+        messages = prompts.answer_messages(result.goal, self._day(result.started_at), facts)
         try:
             synthesis = self._generate(messages, Synthesis, purpose="answer")
         except AnswerPending:
@@ -452,7 +459,7 @@ class Researcher:
         progress: Callable[[str], None],
     ) -> RunResult:
         started = self._started()
-        today = started.date()
+        today = self._day(started)
         warnings: list[str] = []
         self._copies, self._looked_up, self._archive_down = {}, 0, None
         self._landed, self._moves, self._search_down = {}, {}, None
@@ -1162,7 +1169,7 @@ class Researcher:
         started: datetime,
         warnings: list[str],
     ) -> RunResult:
-        today = started.date()
+        today = self._day(started)
         extraction = self._extract(goal, plan, sources, today, warnings)
         findings = verify(extraction.findings[:MAX_FINDINGS], sources)
         if plan.kind == "price":

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from scout.errors import ScoutError
+from scout.files import write_atomic
 from scout.llm.base import Completion, CompletionRequest
 from scout.research.results import Plan, RunResult, Source
 from scout.textutil import fold
@@ -71,8 +72,7 @@ class EvalCase:
         }
         if self.replies:
             data["replies"] = {step: list(texts) for step, texts in self.replies.items()}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +141,7 @@ def score(case: EvalCase, result: RunResult) -> EvalScore:
 def save_scores(scores: Sequence[EvalScore], path: Path) -> None:
     """Keep scores as a baseline for later runs to be compared with."""
     data = {score.case: score.to_dict() for score in scores}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def load_scores(path: Path) -> dict[str, EvalScore]:

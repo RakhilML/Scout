@@ -142,6 +142,61 @@ def test_show_unknown_run_and_models_without_a_server(workspace):
     assert "SCOUT_LLM=openai" in models.output
 
 
+OFFERED = {"data": [{"id": "qwen3-32b"}, {"id": "qwen3-4b"}, {"id": "llama3"}]}
+
+
+@responses.activate
+def test_models_lists_the_server_models_before_a_model_is_chosen(workspace, monkeypatch):
+    responses.add(responses.GET, "http://llm.local:1234/v1/models", json=OFFERED)
+    monkeypatch.setenv("SCOUT_LLM", "openai")
+    monkeypatch.setenv("LM_STUDIO_BASE_URL", "http://llm.local:1234/v1")
+    monkeypatch.delenv("SCOUT_PLANNER_MODEL", raising=False)
+    listed = invoke("models")
+    assert listed.exit_code == 0, listed.output
+    assert listed.output.splitlines() == ["  qwen3-32b", "  qwen3-4b", "  llama3"]
+
+
+@pytest.mark.parametrize("llm", ["openai", "record:fixture"])
+@responses.activate
+def test_models_marks_the_main_and_the_planning_model(workspace, monkeypatch, llm):
+    responses.add(responses.GET, "http://llm.local:1234/v1/models", json=OFFERED)
+    monkeypatch.setenv("SCOUT_LLM", llm)
+    monkeypatch.setenv("LM_STUDIO_BASE_URL", "http://llm.local:1234/v1")
+    monkeypatch.setenv("LM_STUDIO_MODEL", "qwen3-32b")
+    monkeypatch.setenv("SCOUT_PLANNER_MODEL", "qwen3-4b")
+    listed = invoke("models")
+    assert listed.exit_code == 0, listed.output
+    assert listed.output.splitlines() == [
+        "\N{BLACK CIRCLE} qwen3-32b",
+        "  qwen3-4b (planning)",
+        "  llama3",
+    ]
+
+
+def test_exports_are_written_whole_or_not_at_all(workspace, monkeypatch):
+    with Store(load_settings().db_path) as store:
+        run_id = store.add_run(RESULT)
+    assert invoke("rate", str(run_id), "1", "good").exit_code == 0
+    assert invoke("ratings", "--export", "ratings.jsonl").exit_code == 0
+    assert invoke("export", "notes").exit_code == 0
+    ratings, (note,) = workspace / "ratings.jsonl", (workspace / "notes").glob("*.md")
+    before = ratings.read_bytes(), note.read_bytes()
+    assert b"\r\n" not in before[0] + before[1]  # the same files on every system
+    assert json.loads(before[0])["verdict"] == "good"
+
+    with Store(load_settings().db_path) as store:
+        (rating,) = store.ratings()
+    # The second cannot be UTF-8: the export fails part way.
+    changed = [replace(rating, note="rated again"), replace(rating, claim="half \ud800")]
+    monkeypatch.setattr(Store, "ratings", lambda self, **where: changed)
+    monkeypatch.setattr("scout.cli.research.render_note", lambda result, **options: "\ud800")
+    with pytest.raises(UnicodeEncodeError):
+        invoke("ratings", "--export", "ratings.jsonl")
+    with pytest.raises(UnicodeEncodeError):
+        invoke("export", "notes", "--overwrite")
+    assert (ratings.read_bytes(), note.read_bytes()) == before
+
+
 @pytest.mark.parametrize(
     ("region", "header"),
     [

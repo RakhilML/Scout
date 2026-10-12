@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from scout.errors import ScoutError
 from scout.evaluate import EvalCase, EvalScore, RecordedReplies, score
 from scout.llm import make_backend, model_server
 from scout.llm.base import Backend
+from scout.llm.exchange import SESSION_FILE, ExchangeBackend
 from scout.llm.probe import AGENT_CONTEXT_TOKENS, Capabilities, probe
 from scout.research.pipeline import Researcher, ResearchOptions
 from scout.research.results import CHECK_KIND, RunResult, Source
@@ -21,6 +22,7 @@ from scout.web.render import make_renderer
 from scout.web.search import CachedSearch, language_tag, make_search_backend
 
 CAPABILITIES_TTL = timedelta(hours=24)
+_EVER = datetime.min.replace(tzinfo=UTC)  # any age: an expired probe still tells what was found
 # Interactive runs reuse an hour of cached searches and pages.
 SEARCH_CACHE_SECONDS = 3600.0
 # Watches want the current web: pages are revalidated (ETag) after five minutes.
@@ -97,23 +99,33 @@ class App:
             return self._backend
 
     def capabilities(self, *, refresh: bool = False, test_structured: bool = False) -> Capabilities:
-        """What the configured model can do; probed at most once a day unless *refresh*."""
+        """What the configured model can do; probed at most once a day unless *refresh*. A
+        probe that does not test structured output keeps the mode found before. A recorded
+        session's requests were built with its own capabilities, so a replay gets those."""
+        recorded = self._recorded()
+        if recorded is not None:
+            return recorded
         key = self._capabilities_key()
         now = datetime.now(UTC)
         if not refresh:
             cached = self.store.get_capabilities(key, newer_than=now - CAPABILITIES_TTL)
             if cached is not None:
-                return Capabilities.from_dict(cached)
+                return self._recording(Capabilities.from_dict(cached))
+        earlier = None if test_structured else self.store.get_capabilities(key, newer_than=_EVER)
         found = probe(
             self.backend,
             context_override=self.settings.context_tokens,
             test_structured=test_structured,
+            known_mode=Capabilities.from_dict(earlier).structured_mode if earlier else None,
         )
         self.store.put_capabilities(key, found.to_dict(), now)
-        return found
+        return self._recording(found)
 
     def learn_from(self, researcher: Researcher) -> None:
-        """Keep what a run discovered about the model, such as a json_schema mode that failed."""
+        """Keep what a run discovered about the model, such as a json_schema mode that failed.
+        A recorded session's capabilities stay as they were recorded."""
+        if self._recorded() is not None:
+            return
         found = self.capabilities()
         if researcher.structured_mode is not found.structured_mode:
             updated = replace(found, structured_mode=researcher.structured_mode)
@@ -141,7 +153,7 @@ class App:
             max_results=self.settings.max_results,
             region=self.settings.region,
             context_tokens=found.context_tokens,
-            max_source_chars=self.settings.max_source_chars,
+            max_source_chars=self._page_chars(),
             structured_mode=found.structured_mode,
             reasoning_options=found.reasoning_options,
         )
@@ -154,6 +166,7 @@ class App:
             pins=self.store,
             pin_scope=scope,
             archive=self.archive if archive else None,
+            today=self._session_day(),
         )
 
     def restore_sources(self, result: RunResult) -> tuple[list[Source], int]:
@@ -269,6 +282,56 @@ class App:
         server = model_server(self.backend)
         where = server.base_url if server is not None else "local"
         return f"{where}|{self.backend.model}|{self.settings.context_tokens or ''}"
+
+    def _recorded(self) -> Capabilities | None:
+        """The capabilities of the recorded session the backend answers from, if any. They win
+        over the settings: the recorded request keys depend on them."""
+        backend = self.backend
+        if not isinstance(backend, ExchangeBackend) or backend.inner is not None:
+            return None
+        session = backend.session
+        if session is None:
+            return None
+        day = f" of {session.today}" if session.today else ""
+        return Capabilities(
+            model=backend.model,
+            context_tokens=session.context_tokens
+            or self.settings.context_tokens
+            or AGENT_CONTEXT_TOKENS,
+            structured_mode=session.structured_mode,
+            reasoning_options=session.reasoning_options,
+            note=f"from the recorded session{day} ({backend.directory / SESSION_FILE})",
+        )
+
+    def _recording(self, found: Capabilities) -> Capabilities:
+        """*found*, which a recording also keeps in its session file, for replays. A new
+        session is of today."""
+        backend = self.backend
+        if isinstance(backend, ExchangeBackend) and backend.inner is not None:
+            backend.keep_session(
+                context_tokens=found.context_tokens,
+                max_page_chars=self.settings.max_source_chars,
+                reasoning_options=found.reasoning_options,
+                today=datetime.now(UTC).date(),
+            )
+        return found
+
+    def _page_chars(self) -> int:
+        """Page text per source in a prompt: the recorded session's when the backend answers
+        from one (its requests were built with it), else SCOUT_MAX_PAGE_CHARS."""
+        backend = self.backend
+        if isinstance(backend, ExchangeBackend) and backend.inner is None:
+            session = backend.session
+            if session is not None and session.max_page_chars:
+                return session.max_page_chars
+        return self.settings.max_source_chars
+
+    def _session_day(self) -> date | None:
+        """The day of the recorded session the backend records or answers from, if any: its
+        runs take it as today, so a replay on a later day asks and judges as the recording."""
+        backend = self.backend
+        session = backend.session if isinstance(backend, ExchangeBackend) else None
+        return session.today if session is not None else None
 
 
 def accept_language(region: str) -> str:

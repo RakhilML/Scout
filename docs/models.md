@@ -35,7 +35,7 @@ The diagram shows how Scout selects the backend that answers each model request.
 
 ```bash
 scout factcheck --cited -f answer.md --llm exchange:./answers
-scout replay RUN --llm record:./answers
+scout replay RUN --llm record:./fixture
 ```
 
 Rules for the value:
@@ -152,12 +152,16 @@ The last line is a note, for example where the context window came from.
 - If a reply is not valid, Scout asks the model one time to correct it.
 - Other commands use the result of `scout check` for a day. After a day, they ask the server
   again for the context window and the reasoning levels. They do not test schema-constrained
-  output, so they use `prompt` mode until the next `scout check`.
+  output again. They keep the structured mode that Scout found before, with the note
+  `json_schema mode (kept from before)`. The gpt-oss rule above still applies.
 - A run in which `json_schema` output fails changes to `prompt` mode, and Scout remembers this.
+  This also stays after a day, until the next `scout check`.
 - When the server reports reasoning levels, Scout asks for `low` in the plan step and for
   `medium` in the other steps, if the model has these levels.
 - With `exchange:DIR` or `replay:DIR`, `scout check` asks no server. It shows 32768 tokens (or
-  `SCOUT_CONTEXT_TOKENS`), `prompt` mode and the note `answered through exchange files`.
+  `SCOUT_CONTEXT_TOKENS`), `prompt` mode and the note `answered through exchange files`. If DIR
+  has a session file from `record:DIR`, it shows the recorded values and the note
+  `from the recorded session of DAY (PATH)`. See [The session file](#the-session-file).
 
 > [!NOTE]
 > Run `scout check` again after you change the model, the server or `SCOUT_CONTEXT_TOKENS`.
@@ -169,14 +173,15 @@ The last line is a note, for example where the context window came from.
 scout models
 ```
 
-`scout models` lists the model ids that the server offers. A dot marks the model in
-`LM_STUDIO_MODEL`. It needs `SCOUT_LLM=openai`. With another backend, it stops with
-`` `models` needs SCOUT_LLM=openai (a model server) ``.
+`scout models` lists the model ids that the server offers. Use it to find the id for
+`LM_STUDIO_MODEL`.
 
-> [!NOTE]
-> `scout models` needs a value in `LM_STUDIO_MODEL`. Any value is sufficient. With no value, it
-> stops with ``LM_STUDIO_MODEL is not set; run `scout models` to see what the server offers``.
-> `.env.example` has an example value, so `scout models` works after you copy that file.
+- A dot marks the model in `LM_STUDIO_MODEL`.
+- `(planning)` marks the model in `SCOUT_PLANNER_MODEL`.
+- It works with `SCOUT_LLM=openai` and with `SCOUT_LLM=record:DIR`. `LM_STUDIO_MODEL` and
+  `SCOUT_PLANNER_MODEL` can be empty.
+- With `exchange:DIR` or `replay:DIR`, no server answers. Scout then stops with
+  `` `models` lists what a model server offers: set SCOUT_LLM=openai or record:DIR ``.
 
 ## The exchange backend
 
@@ -208,10 +213,15 @@ the answer is there.
 |---|---|---|
 | `DIR/requests/<key>.md` | Scout | The request: the step, the model name, the temperature and the answer file. Then each message, under a line such as `===== SYSTEM =====` or `===== USER =====`. |
 | `DIR/responses/<key>.txt` | The person or the agent | The reply, as the model would write it, and nothing else |
+| `DIR/responses/<key>.reasoning.txt` | Scout, with `record:DIR` only | The reasoning text of the reply, if the server sent one. Some servers put the whole answer there. |
+| `DIR/responses/<key>.error.json` | Scout, with `record:DIR` only | The error that the server gave in place of an answer: its kind (for example `ContextOverflow`) and its message |
+| `DIR/session.json` | Scout, with `record:DIR` only | What the recorded requests used: the model name, the context window, the structured modes, the reasoning levels and the day. See [The session file](#the-session-file). |
+| `DIR/session.json.lock` | Scout, with `record:DIR` only | A lock: one process at a time changes `session.json` |
 
 - **The key** is 16 hexadecimal characters. It is a hash of the model name, the messages, the
   schema and the temperature. The same request always gets the same key, and so the same answer
-  file. With `exchange:DIR`, the model name is `exchange`.
+  file. With `exchange:DIR`, the model name is `exchange`. If DIR has a session file, the model
+  name is the recorded name.
 - When Scout writes a request, it also makes the folder `DIR/responses/`, ready for the answer.
 - The request file tells the answerer: "Write the model's reply, and nothing else, to the answer
   file. Use only the information in the messages below."
@@ -220,7 +230,7 @@ the answer is there.
   Scout reads the first JSON object in the reply. If the reply is not valid, Scout asks one time
   to correct it. That is a new request, which holds the bad reply and the problem.
 - Scout assumes a context window of 32768 tokens for an agent. `SCOUT_CONTEXT_TOKENS` changes
-  this.
+  this. If DIR has a session file, Scout uses the recorded context window.
 
 ### Exit code 75: run again to continue
 
@@ -267,7 +277,8 @@ To use the exchange backend for all commands, set `SCOUT_LLM=exchange:./answers`
 
 `record:DIR` and `replay:DIR` use the same files as `exchange:DIR`. `record:DIR` keeps a record of
 a real session with the model server. `replay:DIR` answers only from saved answer files, with no
-server.
+server. A replay sends the same requests as the recording, so it gets the same answers and gives
+the same result.
 
 ```mermaid
 flowchart TD
@@ -282,19 +293,127 @@ flowchart TD
 The diagram shows what each backend does with a model request.
 
 - **`record:DIR`** uses the model server, with all the `openai` settings (the planner model
-  too). Scout saves each request and its answer in DIR. If DIR already has the answer to a
-  request, Scout uses it and does not ask the server.
-- **`replay:DIR`** answers only from the answer files in DIR. It asks no server. A request with
-  no answer file stops the command with `no recorded answer for the STEP request KEY`.
-- A request that changes in any way (other pages, another model name, another context window)
-  gets another key. `replay:DIR` then has no answer for it.
+  too). Scout saves each request and its answer in DIR, with the reasoning text if the server
+  sent one. If DIR already has the answer to a request, Scout uses it and does not ask the
+  server.
+- When the server gives an error in place of an answer, `record:DIR` saves the error. A run can
+  continue after some errors: it sends less page text after a prompt that is too long, changes
+  to `prompt` mode after a refused schema, and a deep run stops looking further after any
+  error. For a request with a saved error, `record:DIR` asks the server again, and saves what
+  happens now.
+- **`replay:DIR`** answers only from the files in DIR. It asks no server. It gives each saved
+  answer exactly, with its reasoning text, and it raises each saved error again. So the replay
+  continues as the recorded run did. A request with no answer file stops the command with
+  `no recorded answer for the STEP request KEY`.
+- `exchange:DIR` also raises a saved error again. To give an answer in its place, write the
+  answer file: an answer file wins over a saved error.
+- Scout writes each file in one step. If a recording stops, DIR holds no half-written answer.
+- A request that changes in any way gets another key, and `replay:DIR` has no answer for it.
+  See [What a replay needs](#what-a-replay-needs).
 
-> [!CAUTION]
-> In this version, `replay:DIR` does not find the answers that `record:DIR` saved. The key holds
-> the model name: `record:DIR` uses the name in `LM_STUDIO_MODEL`, and `replay:DIR` uses the
-> name `exchange`. `replay:DIR` finds the answers of an `exchange:DIR` session. To use recorded
-> answers again, run `record:DIR` again with the same model and settings. Scout then uses each
-> saved answer to the same request, and asks the server only for the other requests.
+### The session file
+
+A request does not hold only the question. The context window and the page size set how much
+page text goes into the prompt. The structured mode puts the JSON schema into the request
+(`json_schema`) or into the messages (`prompt`). Each prompt also gives the date. So
+`record:DIR` also writes `DIR/session.json`:
+
+```json
+{
+  "model": "qwen3-8b",
+  "context_tokens": 16384,
+  "max_page_chars": 6000,
+  "structured_modes": ["json_schema", "prompt"],
+  "reasoning_options": ["low", "medium", "high"],
+  "today": "2026-10-12"
+}
+```
+
+| Field | What it holds |
+|---|---|
+| `model` | The model name in the request keys: `LM_STUDIO_MODEL` |
+| `context_tokens` | The context window that the requests used |
+| `max_page_chars` | The page text for each source: `SCOUT_MAX_PAGE_CHARS` |
+| `structured_modes` | The structured modes of the recorded requests |
+| `reasoning_options` | The reasoning levels that the server reported |
+| `today` | The day of the session (UTC): the day that the first recorded run used |
+
+Scout writes the session file when it records the first request. A command that records
+nothing, for example `scout check` with `SCOUT_LLM=record:DIR`, does not write it. Scout ignores
+a session file that holds no recorded request.
+
+A recording selects its day one time, before its first run: the day of the session in the
+folder, or else the current day. Then it keeps that day, because its prompts give it.
+
+Two processes can record into one folder at the same time, for example the daemon and a
+command. Before each change, Scout reads the session file again under a lock, and keeps the
+modes of both processes. If the session in the folder has another day than the recording (for
+example, two recordings that started before and after midnight), the recording stops with
+`the session in DIR was recorded on DAY, and this run asks with DAY: record into a new folder`.
+
+Each run on a folder with a session file uses the day of the session as today. This applies to
+`record:DIR`, `replay:DIR` and `exchange:DIR`. The day goes into the prompts. Scout also uses it
+to find old news and to set the confidence. The start time of the run stays the real time. So a
+replay on a later day sends the same requests and gives the same result.
+
+`replay:DIR` and `exchange:DIR` also use these values of the session file:
+
+- The request keys use the recorded model name, not `exchange`.
+- Scout uses the recorded context window, page size and reasoning levels. It asks no server for
+  them. The recorded values win over `SCOUT_CONTEXT_TOKENS` and `SCOUT_MAX_PAGE_CHARS`, because
+  the keys depend on them.
+- A replay starts in `json_schema` mode if a recorded request used it. Else it starts in `prompt`
+  mode.
+- If a recorded run changed from `json_schema` to `prompt` mode, the replay changes at the same
+  step: it gets the same saved error, or the same reply that is not valid.
+- After such a run, Scout records the next runs in `prompt` mode only. The session then holds
+  both modes. A replay of such a run starts in `json_schema` mode and finds no answer for its
+  first request. It then changes to `prompt` mode and finds the recorded answers.
+
+A folder with no session file works as before: the model name is `exchange`, the context window
+is 32768 tokens (or `SCOUT_CONTEXT_TOKENS`), the mode is `prompt` and each run uses its own day.
+
+> [!NOTE]
+> A folder holds one session: one model, one context window, one page size and one day. A later
+> recording into the folder also uses the day of the session, so each recorded request stays
+> replayable. If the model, the context window or the page size changes, Scout starts a new
+> session with the current day. A replay then does not find the answers that were recorded
+> before the change. To record with the current day, use a new folder.
+
+### What a replay needs
+
+The session file gives the model name, the context window, the page size, the structured mode
+and the day. A replay also needs these:
+
+- **The same pages.** `scout replay RUN` and `scout eval run` use the stored pages of a run or a
+  case, so their prompts do not change. `scout run` and `scout factcheck` search and read the
+  web again. Replay them only while the search and page caches still hold the same results.
+- **The same settings for search.** `SCOUT_MAX_RESULTS` and `SCOUT_REGION` decide which pages a
+  run reads. The session file does not hold them.
+
+If a request is not the same, the replay stops with
+`no recorded answer for the STEP request KEY`.
+
+### Make an offline test fixture
+
+An eval case holds the pages that it reads, so its prompts do not change. This makes it a good
+fixture.
+
+1. Record the answers of the model server:
+
+   ```bash
+   scout eval run cases/ --llm record:./fixture --save base.json
+   ```
+
+2. Replay them with no server, on the same day or later:
+
+   ```bash
+   scout eval run cases/ --llm replay:./fixture --against base.json
+   ```
+
+3. Make sure that the replay shows `Nothing got worse`.
+
+`scout replay RUN` also works with `record:DIR` and then `replay:DIR`.
 
 ## Test models and prompts
 
@@ -327,7 +446,7 @@ does no search and downloads no page.
 
 | Option | What it does |
 |---|---|
-| `--llm TEXT` | The model to analyze with, for example `record:./answers` |
+| `--llm TEXT` | The model to analyze with, for example `record:./fixture` |
 | `--json` | Print the new result as JSON |
 | `--no-save` | Do not keep the replay as a new run |
 

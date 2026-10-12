@@ -58,9 +58,14 @@ class _Ping(BaseModel):
 
 
 def probe(
-    backend: Backend, *, context_override: int | None = None, test_structured: bool = False
+    backend: Backend,
+    *,
+    context_override: int | None = None,
+    test_structured: bool = False,
+    known_mode: StructuredMode | None = None,
 ) -> Capabilities:
-    """Ask the server about the model; optionally try one tiny schema-constrained request."""
+    """Ask the server about the model; optionally try one tiny schema-constrained request.
+    Without that test, *known_mode* (what an earlier test or run found) is kept."""
     server = model_server(backend)
     if server is None:
         return Capabilities(
@@ -86,6 +91,9 @@ def probe(
     elif test_structured:
         mode = _schema_mode_if_it_works(server)
         notes.append(f"{mode.value} mode (tested)")
+    elif known_mode is not None:
+        mode = known_mode
+        notes.append(f"{mode.value} mode (kept from before)")
 
     return Capabilities(
         model=server.model,

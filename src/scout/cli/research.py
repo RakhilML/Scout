@@ -19,7 +19,7 @@ from scout.cli._common import KINDS, RECENCY, err, linked, out, settings, when
 from scout.errors import AnswerPending, LLMError, ScoutError
 from scout.evaluate import EvalCase, case_files, load_scores, regressions, save_scores
 from scout.files import write_atomic
-from scout.llm.openai_compat import OpenAICompatBackend
+from scout.llm import named_server
 from scout.report import (
     note_name,
     render_html,
@@ -487,9 +487,8 @@ def ratings(export_path: Path | None) -> None:
     with App(settings()) as app:
         found = app.store.ratings()
     if export_path is not None:
-        with export_path.open("w", encoding="utf-8") as handle:
-            for rating in found:
-                handle.write(json.dumps(rating.to_dict(), ensure_ascii=False) + "\n")
+        lines = (json.dumps(rating.to_dict(), ensure_ascii=False) + "\n" for rating in found)
+        write_atomic(export_path, "".join(lines))
         out.print(f"Wrote {len(found)} rating(s) to {escape(str(export_path))}", soft_wrap=True)
         return
     if not found:
@@ -567,13 +566,21 @@ def check() -> None:
 @click.command()
 def models() -> None:
     """List the models the server offers."""
-    with App(settings()) as app:
-        backend = app.backend
-        if not isinstance(backend, OpenAICompatBackend):
-            raise click.UsageError("`models` needs SCOUT_LLM=openai (a model server)")
-        for model_id in backend.list_models():
-            marker = "[green]\N{BLACK CIRCLE}[/]" if model_id == backend.model else " "
-            out.print(f"{marker} {escape(model_id)}")
+    current = settings()
+    server = named_server(current)
+    if server is None:
+        raise click.UsageError(
+            "`models` lists what a model server offers: set SCOUT_LLM=openai or record:DIR"
+        )
+    try:
+        offered = server.list_models()
+    finally:
+        server.close()
+    planner = current.planner_model if current.planner_model != current.llm_model else ""
+    for model_id in offered:
+        marker = "[green]\N{BLACK CIRCLE}[/]" if model_id == current.llm_model else " "
+        planning = " (planning)" if model_id == planner else ""
+        out.print(f"{marker} {escape(model_id)}{planning}")
 
 
 @click.command()
@@ -640,8 +647,7 @@ def export(folder: Path, run_ids: tuple[int, ...], kind: str, overwrite: bool) -
                 kept += 1
                 continue
             render = render_note if kind == "note" else render_html
-            folder.mkdir(parents=True, exist_ok=True)
-            path.write_text(render(result, run_id=run_id), encoding="utf-8")
+            write_atomic(path, render(result, run_id=run_id))
             written += 1
     already = f"; {kept} were already there" if kept else ""
     out.print(f"Wrote {written} file(s) to {escape(str(folder))}{already}.", soft_wrap=True)
@@ -649,7 +655,7 @@ def export(folder: Path, run_ids: tuple[int, ...], kind: str, overwrite: bool) -
 
 @click.command()
 @click.argument("run_id", type=int)
-@click.option("--llm", "llm_spec", help="The model to analyze with, e.g. record:./answers")
+@click.option("--llm", "llm_spec", help="The model to analyze with, e.g. record:./fixture")
 @click.option("--json", "as_json", is_flag=True, help="Print the new result as JSON.")
 @click.option("--no-save", is_flag=True, help="Do not keep the replay as a new run.")
 def replay(run_id: int, llm_spec: str | None, as_json: bool, no_save: bool) -> None:
